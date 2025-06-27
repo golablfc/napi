@@ -79,6 +79,26 @@ class NapiProjektKatalog:
         milliseconds = int((seconds - int(seconds)) * 1000)
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
+    def _parse_duration(self, duration_text):
+        """Konwertuje tekst czasu (HH:MM:SS lub MM:SS) na sekundy"""
+        try:
+            parts = list(map(float, duration_text.split(':')))
+            if len(parts) == 3:  # HH:MM:SS
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2:  # MM:SS
+                return parts[0] * 60 + parts[1]
+            return None
+        except:
+            return None
+
+    def _calculate_match_score(self, video_duration, sub_duration):
+        """Oblicza procentowe dopasowanie czasowe (0-100)"""
+        if not video_duration or not sub_duration:
+            return 50  # Wartość domyślna gdy brak danych
+        
+        time_diff = abs(video_duration - sub_duration)
+        return max(0, 100 - (time_diff / 60))  # -1% za każdą minutę różnicy
+
     def _handle_old_format(self, data):
         try:
             try:
@@ -180,7 +200,7 @@ class NapiProjektKatalog:
         
         return None
 
-    def search(self, item, imdb_id):
+    def search(self, item, imdb_id, video_duration=None):
         subtitle_list = []
         try:
             title_to_find = item.get('tvshow') or item.get('title') or imdb_id
@@ -231,13 +251,15 @@ class NapiProjektKatalog:
                                 continue
                             
                             self.log(f"Found detail page: {detail_url}")
-                            subs = self._get_subtitles_from_detail(detail_url)
+                            subs = self._get_subtitles_from_detail(detail_url, video_duration)
                             subtitle_list.extend(subs)
                 except Exception as e:
                     self.log("Error processing block", e)
                     continue
             
-            self.log(f"Found {len(subtitle_list)} subtitles")
+            # Sortuj wszystkie znalezione napisy
+            subtitle_list.sort(key=lambda x: x['score'], reverse=True)
+            self.log(f"Found {len(subtitle_list)} subtitles (best score: {subtitle_list[0]['score'] if subtitle_list else 'N/A'})")
             return subtitle_list
             
         except Exception as e:
@@ -245,12 +267,11 @@ class NapiProjektKatalog:
             return []
 
     def _build_detail_url(self, item, href):
-        """Budowanie URL do szczegółów napisów"""
         match = re.search(r'napisy-(\d+)-(.*)', href)
         if match:
             napi_id, slug = match.groups()
             
-            # Całkowicie usuwamy istniejące nawiasy i rok z końca slug
+            # Usuwamy istniejący rok z slug jeśli jest
             slug = re.sub(r'[-\s]*\(?\d{4}\)?$', '', slug).strip('-')
             
             # Budujemy podstawowy URL
@@ -270,8 +291,7 @@ class NapiProjektKatalog:
                 
         return urllib.parse.urljoin(self.base_url, href)
 
-    def _get_subtitles_from_detail(self, detail_url):
-        """Pobieranie listy napisów ze strony szczegółów"""
+    def _get_subtitles_from_detail(self, detail_url, video_duration=None):
         subs = []
         try:
             req = urllib.request.Request(
@@ -281,24 +301,28 @@ class NapiProjektKatalog:
                 }
             )
             with urllib.request.urlopen(req, timeout=15) as response:
-                detail_page = response.read().decode('utf-8')
-                
-            soup = BeautifulSoup(detail_page, 'lxml')
+                soup = BeautifulSoup(response.read(), 'lxml')
+
             for row in soup.select('tbody > tr'):
                 link = row.find('a', href=re.compile(r'napiprojekt:'))
-                if link:
-                    cols = row.find_all('td')
-                    if len(cols) > 4:
-                        sub_data = {
-                            'language': 'pol',
-                            'label': f"{cols[1].get_text(strip=True)} | {cols[3].get_text(strip=True)} | {cols[4].get_text(strip=True)}",
-                            'link_hash': link['href'].replace('napiprojekt:', ''),
-                            'duration_text': cols[3].get_text(strip=True),
-                            'fps': cols[4].get_text(strip=True),
-                            'downloads': cols[5].get_text(strip=True) if len(cols) > 5 else 'N/A'
-                        }
-                        subs.append(sub_data)
-                        self.log(f"Found subtitle: {sub_data}")
+                if not link:
+                    continue
+                    
+                cols = row.find_all('td')
+                if len(cols) < 5:
+                    continue
+
+                duration_text = cols[3].get_text(strip=True)
+                sub_duration = self._parse_duration(duration_text)
+                score = self._calculate_match_score(video_duration, sub_duration)
+
+                subs.append({
+                    'language': 'pol',
+                    'label': f"{cols[1].get_text(strip=True)} | {duration_text}",
+                    'link_hash': link['href'].replace('napiprojekt:', ''),
+                    'score': score,
+                    '_duration': sub_duration
+                })
 
         except Exception as e:
             self.log(f"Detail page error: {detail_url}", e)
