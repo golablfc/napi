@@ -1,217 +1,599 @@
-from flask import Flask, jsonify, request, Response
-from napiprojekt_logic import NapiProjektKatalog
-import re
-import logging
-import requests
-import os
+import urllib.request
+
 import urllib.parse
+
+import re
+
+import base64
+
+import traceback
+
+from xml.dom import minidom
+
+from bs4 import BeautifulSoup
+
+import logging
+
+import zlib
+
+import struct
+
 import time
-from waitress import serve
 
-# Konfiguracja logowania
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('stremio_napiprojekt.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+import binascii
 
-app = Flask(__name__)
-napi_helper = NapiProjektKatalog()
 
-OMDB_API_KEY = os.environ.get('OMDB_API_KEY', 'fdc33d1c')
 
-def fill_item_from_name(name, item):
-    if not name:
-        return
-        
-    try:
-        # First try to clean up the filename by removing extensions and common patterns
-        clean_name = re.sub(r'\.(mp4|avi|mkv|mov|wmv)$', '', name, flags=re.IGNORECASE)
-        clean_name = re.sub(r'[._\-]', ' ', clean_name)
-        clean_name = clean_name.strip()
-        
-        # Try TV show pattern (S01E02 format)
-        tv_match = re.search(r'(.*?)[. ](?:S|s)(\d{1,2})(?:E|e)(\d{1,2}).*', clean_name, re.IGNORECASE)
-        if tv_match:
-            item['tvshow'] = tv_match.group(1).strip()
-            item['season'] = str(int(tv_match.group(2)))
-            item['episode'] = str(int(tv_match.group(3)))
-            return
+class NapiProjektKatalog:
 
-        # Try movie pattern (Title Year format)
-        movie_match = re.search(r'(.+?)\s*\(?(\d{4})\)?', clean_name)
-        if movie_match:
-            item['title'] = movie_match.group(1).strip()
-            item['year'] = movie_match.group(2)
-            return
-            
-        # Fallback - try to extract just the title (everything before the first dot or special char)
-        fallback_match = re.search(r'^([^._\-]+)', clean_name)
-        if fallback_match:
-            item['title'] = fallback_match.group(1).strip()
-            
-    except Exception as e:
-        logger.error(f"Error parsing filename: {str(e)}")
+    def __init__(self):
 
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
+        self.logger = logging.getLogger(__name__)
 
-@app.route('/')
-def index():
-    return jsonify({
-        "message": "NapiProjekt Stremio Addon (Python)",
-        "manifest": f"{request.url_root}manifest.json",
-        "version": "1.3.0"
-    })
+        self.download_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
 
-@app.route('/manifest.json')
-def manifest():
-    return jsonify({
-        "id": "org.stremio.napiprojekt.python",
-        "version": "1.3.0",
-        "name": "NapiProjekt PL",
-        "description": "Napisy PL z NapiProjekt - czas trwania, FPS, pobrania",
-        "logo": "https://d3npyywa6qnolf.cloudfront.net/prod/user/337361/eyJ1cmwiOiJodHRwczpcL1wvcGF0cm9uaXRlLnBsXC91cGxvYWRcL3VzZXJcLzMzNzM2MVwvYXZhdGFyX29yaWcuanBnPzE1ODk5NjY3NjMiLCJlZGl0cyI6eyJyZXNpemUiOnsid2lkdGgiOjI5MH0sInRvRm9ybWF0Ijoid2VicCJ9fQ%3D%3D/wIDQ1%2FJ8QvTzsI29KHkeWnO5G0BuCBY00wpksnlpJfs%3D",
-        "resources": ["subtitles"],
-        "types": ["movie", "series"],
-        "catalogs": [],
-        "idPrefixes": ["tt"],
-        "behaviorHints": {
-            "configurable": False,
-            "configurationRequired": False
-        }
-    })
+        self.search_url = "https://www.napiprojekt.pl/ajax/search_catalog.php"
 
-@app.route('/subtitles/<content_type>/<path:imdb_id_with_params>.json')
-def get_subtitles(content_type, imdb_id_with_params):
-    try:
-        item = {}
-        decoded_id = urllib.parse.unquote(imdb_id_with_params)
-        
-        # Extract base IMDB ID (ttXXXXXXX) even if there are additional parameters
-        base_imdb_id = re.search(r'(tt\d+)', decoded_id).group(1) if re.search(r'(tt\d+)', decoded_id) else decoded_id.split(':')[0]
-        
-        item['imdb_id'] = base_imdb_id
-        video_filename = request.args.get('filename') or request.args.get('videoFileName')
-        
-        if video_filename:
-            fill_item_from_name(video_filename, item)
-        
-        if not item.get('title') and not item.get('tvshow') and base_imdb_id.startswith('tt'):
-            try:
-                omdb_response = requests.get(
-                    f"https://www.omdbapi.com/?i={base_imdb_id}&apikey={OMDB_API_KEY}",
-                    timeout=10
-                ).json()
+        self.base_url = "https://www.napiprojekt.pl"
+
+        self.logger.info("NapiProjektKatalog initialized")
+
+
+
+    def log(self, message, ex=None):
+
+        """Uniwersalna metoda logowania"""
+
+        if ex:
+
+            self.logger.error(f"{message}\n{traceback.format_exc()}")
+
+        else:
+
+            self.logger.info(message)
+
+
+
+    def _decrypt(self, data):
+
+        """Deszyfrowanie danych NP"""
+
+        key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
+
+        decrypted = bytearray(data)
+
+        for i in range(len(decrypted)):
+
+            decrypted[i] ^= key[i % 8]
+
+            decrypted[i] = ((decrypted[i] << 4) & 0xFF) | (decrypted[i] >> 4)
+
+        return bytes(decrypted)
+
+
+
+    def _convert_microdvd_to_srt(self, content):
+
+        """Ulepszona konwersja do formatu SRT"""
+
+        try:
+
+            if not content:
+
+                return None
+
                 
-                if omdb_response.get('Response') == 'True':
-                    item['title'] = omdb_response.get('Title', '').strip()
-                    item['year'] = omdb_response.get('Year', '').strip()
-                    if omdb_response.get('Type') == 'series':
-                        item['tvshow'] = item.pop('title', None)
-            except Exception as e:
-                logger.error(f"OMDB API error: {str(e)}")
 
-        if content_type == 'series' and len(decoded_id.split(':')) > 2:
-            parts = decoded_id.split(':')
-            item['season'] = parts[1]
-            item['episode'] = parts[2].split('/')[0]
-            if not item.get('tvshow'):
-                item['tvshow'] = item.pop('title', base_imdb_id)
-        
-        found_subtitles = napi_helper.search(item, base_imdb_id)
-        stremio_subtitles = []
-        
-        for sub in found_subtitles:
-            sub_id = f"{base_imdb_id}_{sub['link_hash']}_{sub['language']}"
-            
-            # Build compact metadata string
-            meta_parts = []
-            if sub.get('duration_text') and sub['duration_text'].lower() != 'b.d.':
-                meta_parts.append(f"{sub['duration_text']}")
-            if sub.get('fps'):
-                meta_parts.append(f"{sub['fps']}fps")
-            if sub.get('downloads'):
-                meta_parts.append(f"⬇{sub['downloads']}")
-            
-            metadata = " ".join(meta_parts) if meta_parts else "NapiProjekt"
-            
-            stremio_subtitles.append({
-                "id": sub_id,
-                "url": f"{request.url_root}subtitles/download/{sub_id}.srt",
-                "lang": sub['language'],
-                "name": metadata,
-            })
-            
-        logger.info(f"Found {len(stremio_subtitles)} subtitles for {base_imdb_id}")
-        return jsonify({"subtitles": stremio_subtitles})
-        
-    except Exception as e:
-        logger.error(f"Error in get_subtitles: {str(e)}", exc_info=True)
-        return jsonify({"subtitles": []})
+            # Jeśli już w formacie SRT, zwróć bez konwersji
 
-@app.route('/subtitles/download/<sub_id>.srt')
-def download_subtitle_file(sub_id):
-    try:
-        parts = sub_id.split('_')
-        if len(parts) < 3:
-            logger.warning(f"Invalid subtitle ID format: {sub_id}")
-            return "Invalid subtitle ID", 400
+            if '-->' in content and '\n\n' in content:
 
-        napiprojekt_hash = parts[-2]
-        logger.info(f"Downloading subtitle with hash: {napiprojekt_hash}")
+                return content
+
+                
+
+            lines = content.splitlines()
+
+            srt_lines = []
+
+            counter = 1
+
+            fps = 23.976
+
+
+
+            for line in lines:
+
+                line = line.strip()
+
+                if not line:
+
+                    continue
+
+                    
+
+                match = re.match(r'\{(\d+)\}\{(\d+)\}(.*)', line)
+
+                if match:
+
+                    start_frame, end_frame, text = match.groups()
+
+                    
+
+                    # Konwersja klatek na czas
+
+                    start_time = int(start_frame) / fps
+
+                    end_time = int(end_frame) / fps
+
+                    
+
+                    # Formatowanie czasu
+
+                    start_str = self._format_time(start_time)
+
+                    end_str = self._format_time(end_time)
+
+                    
+
+                    # Budowanie bloku SRT
+
+                    srt_lines.append(f"{counter}\n{start_str} --> {end_str}\n{text.replace('|', '\n')}\n\n")
+
+                    counter += 1
+
+            
+
+            return ''.join(srt_lines) if srt_lines else None
+
+            
+
+        except Exception as e:
+
+            self.log("Error converting MicroDVD to SRT", e)
+
+            return None
+
+
+
+    def _format_time(self, seconds):
+
+        """Formatowanie czasu do formatu SRT"""
+
+        hours = int(seconds / 3600)
+
+        minutes = int((seconds % 3600) / 60)
+
+        seconds_val = int(seconds % 60)
+
+        milliseconds = int((seconds - int(seconds)) * 1000)
+
+        return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
+
+
+
+    def _handle_old_format(self, data):
+
+        """Rozszerzona obsługa starych formatów"""
+
+        try:
+
+            # Najpierw spróbuj standardowego dekodowania
+
+            try:
+
+                text = data.decode('utf-8-sig')  # Obsługa BOM
+
+                if "{" in text:
+
+                    converted = self._convert_microdvd_to_srt(text)
+
+                    if converted:
+
+                        return converted
+
+                return text
+
+            except UnicodeDecodeError:
+
+                pass
+
+
+
+            # Specjalna obsługa dla nagłówka f693f4
+
+            if len(data) > 10 and data[:3] == b'\xf6\x93\xf4':
+
+                try:
+
+                    decrypted = bytes(b ^ 0x66 for b in data[10:])
+
+                    text = decrypted.decode('utf-8')
+
+                    converted = self._convert_microdvd_to_srt(text)
+
+                    if converted:
+
+                        return converted
+
+                    return text
+
+                except Exception as e:
+
+                    self.log("Special f693f4 format decoding failed", e)
+
+
+
+            # Próba różnych kodowań
+
+            for encoding in ['utf-8', 'iso-8859-2', 'windows-1250', 'cp1250']:
+
+                try:
+
+                    text = data.decode(encoding)
+
+                    if "{" in text:
+
+                        converted = self._convert_microdvd_to_srt(text)
+
+                        if converted:
+
+                            return converted
+
+                    return text
+
+                except UnicodeDecodeError:
+
+                    continue
+
+
+
+        except Exception as e:
+
+            self.log("Critical error in _handle_old_format", e)
+
+            # Zapis nieudanego pliku do analizy
+
+            try:
+
+                filename = f"failed_sub_{int(time.time())}.bin"
+
+                with open(filename, "wb") as f:
+
+                    f.write(data)
+
+                self.log(f"Saved failed subtitle to {filename}")
+
+            except:
+
+                pass
+
         
+
+        return None
+
+
+
+    def download(self, md5hash):
+
+        """Pobieranie napisów z wieloma próbami"""
+
         for attempt in range(3):
+
             try:
-                start_time = time.time()
-                subtitle_content = napi_helper.download(napiprojekt_hash)
+
+                params = {
+
+                    'mode': '17',
+
+                    'client': 'NapiProjektPython',
+
+                    'downloaded_subtitles_id': md5hash,
+
+                    'downloaded_subtitles_lang': 'PL',
+
+                    'downloaded_subtitles_txt': '1'
+
+                }
+
+                data = urllib.parse.urlencode(params).encode('utf-8')
+
+                req = urllib.request.Request(
+
+                    self.download_url, 
+
+                    data=data,
+
+                    headers={
+
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+
+                    }
+
+                )
+
                 
-                if subtitle_content:
-                    if not subtitle_content.startswith('\ufeff'):
-                        subtitle_content = '\ufeff' + subtitle_content
+
+                with urllib.request.urlopen(req, timeout=15) as response:
+
+                    if response.status != 200:
+
+                        continue
+
+                        
+
+                    xml = minidom.parseString(response.read())
+
+                    content = xml.getElementsByTagName('content')[0].firstChild.data
+
+                    binary_data = base64.b64decode(content)
+
+
+
+                    # Nowy format NP
+
+                    if binary_data.startswith(b'NP'):
+
+                        decrypted = self._decrypt(binary_data[4:])
+
+                        if len(decrypted) < 8:
+
+                            continue
+
+                            
+
+                        crc = struct.unpack('<I', decrypted[:4])[0]
+
+                        actual_data = decrypted[4:]
+
+                        
+
+                        if zlib.crc32(actual_data) & 0xFFFFFFFF != crc:
+
+                            continue
+
+                            
+
+                        decompressed = zlib.decompress(actual_data, -zlib.MAX_WBITS)
+
+                        text = decompressed.decode('utf-8')
+
+                        result = self._convert_microdvd_to_srt(text) if "{" in text else text
+
+                        if result:
+
+                            return result
+
                     
-                    subtitle_content = subtitle_content.replace('\r\n', '\n').replace('\r', '\n')
-                    
-                    logger.info(f"Successfully downloaded subtitle {sub_id} in {time.time()-start_time:.2f}s")
-                    
-                    return Response(
-                        subtitle_content,
-                        mimetype='text/plain; charset=utf-8',
-                        headers={
-                            'Content-Disposition': f'attachment; filename="{sub_id}.srt"',
-                            'Cache-Control': 'max-age=86400',
-                        }
-                    )
-                time.sleep(1)
+
+                    # Stary format
+
+                    else:
+
+                        result = self._handle_old_format(binary_data)
+
+                        if result:
+
+                            return result
+
+
+
             except Exception as e:
-                logger.warning(f"Attempt {attempt+1} failed for {sub_id}: {str(e)}")
+
+                self.log(f"Download attempt {attempt+1} failed for hash {md5hash}", e)
+
                 time.sleep(1)
+
         
-        logger.error(f"Failed to download valid subtitle after 3 attempts: {sub_id}")
-        return "Subtitle download failed", 404
-        
-    except Exception as e:
-        logger.error(f"Critical error downloading subtitle {sub_id}: {str(e)}", exc_info=True)
-        return "Internal server error", 500
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Not found"}), 404
+        return None
 
-@app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"Server error: {str(error)}", exc_info=True)
-    return jsonify({"error": "Internal server error"}), 500
 
-if __name__ == '__main__':
-    logger.info("Starting optimized Stremio NapiProjekt addon")
-    app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
-    serve(app, host='0.0.0.0', port=7002)
+
+    def search(self, item, imdb_id):
+
+        """Wyszukiwanie napisów w katalogu"""
+
+        subtitle_list = []
+
+        try:
+
+            title_to_find = item.get('tvshow') or item.get('title')
+
+            if not title_to_find:
+
+                self.log(f"No title for: {imdb_id}")
+
+                return subtitle_list
+
+                
+
+            query_kind = 1 if item.get('tvshow') else 2
+
+            query_year = item.get('year', '').split('–')[0] if item.get('tvshow') else item.get('year', '')
+
+            
+
+            post = {
+
+                'queryKind': str(query_kind),
+
+                'queryString': title_to_find.lower(),
+
+                'queryYear': str(query_year),
+
+                'associate': ''
+
+            }
+
+            
+
+            post_data = urllib.parse.urlencode(post).encode('utf-8')
+
+            headers = {
+
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+
+                'Content-Type': 'application/x-www-form-urlencoded',
+
+                'X-Requested-With': 'XMLHttpRequest'
+
+            }
+
+            
+
+            req = urllib.request.Request(
+
+                self.search_url, 
+
+                data=post_data, 
+
+                headers=headers
+
+            )
+
+            
+
+            with urllib.request.urlopen(req, timeout=15) as response:
+
+                search_results_html = response.read().decode('utf-8')
+
+                
+
+            soup = BeautifulSoup(search_results_html, 'lxml')
+
+            results_blocks = soup.find_all('div', class_='movieSearchContent')
+
+            
+
+            if not results_blocks:
+
+                self.log(f"No results for: {title_to_find}")
+
+                return subtitle_list
+
+                
+
+            for block in results_blocks:
+
+                try:
+
+                    imdb_link = block.find('a', href=re.compile(r'imdb.com/title/(tt\d+)'))
+
+                    if imdb_link and imdb_id in imdb_link['href']:
+
+                        title_link = block.find('a', class_='movieTitleCat')
+
+                        if title_link and title_link.get('href'):
+
+                            detail_url = self._build_detail_url(item, title_link.get('href'))
+
+                            if not detail_url: 
+
+                                continue
+
+                            
+
+                            self.log(f"Found: {detail_url}")
+
+                            subs = self._get_subtitles_from_detail(detail_url)
+
+                            subtitle_list.extend(subs)
+
+                except Exception as e:
+
+                    self.log("Error processing block", e)
+
+                    continue
+
+            
+
+            self.log(f"Found {len(subtitle_list)} subtitles")
+
+            return subtitle_list
+
+            
+
+        except Exception as e:
+
+            self.log("Search error", e)
+
+            return []
+
+
+
+    def _build_detail_url(self, item, href):
+
+        """Budowanie URL do szczegółów napisów"""
+
+        if item.get('tvshow') and item.get('season') and item.get('episode'):
+
+            match = re.search(r'napisy-(\d+)-(.*)', href)
+
+            if match:
+
+                napi_id, slug = match.groups()
+
+                season = str(item['season']).zfill(2)
+
+                episode = str(item['episode']).zfill(2)
+
+                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-s{season}e{episode}"
+
+        return urllib.parse.urljoin(self.base_url, href)
+
+
+
+    def _get_subtitles_from_detail(self, detail_url):
+
+        """Pobieranie listy napisów ze strony szczegółów"""
+
+        subs = []
+
+        try:
+
+            req = urllib.request.Request(
+
+                detail_url, 
+
+                headers={
+
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+
+                }
+
+            )
+
+            with urllib.request.urlopen(req, timeout=15) as response:
+
+                detail_page = response.read().decode('utf-8')
+
+                
+
+            soup = BeautifulSoup(detail_page, 'lxml')
+
+            for row in soup.select('tbody > tr'):
+
+                link = row.find('a', href=re.compile(r'napiprojekt:'))
+
+                if link:
+
+                    cols = row.find_all('td')
+
+                    if len(cols) > 4:
+
+                        subs.append({
+
+                            'language': 'pol',
+
+                            'label': f"{cols[1].get_text(strip=True)} | {cols[3].get_text(strip=True)} | {cols[4].get_text(strip=True)}",
+
+                            'link_hash': link['href'].replace('napiprojekt:', '')
+
+                        })
+
+        except Exception as e:
+
+            self.log(f"Detail page error: {detail_url}", e)
+
+        return subs
