@@ -20,14 +20,12 @@ class NapiProjektKatalog:
         self.logger.info("NapiProjektKatalog initialized")
 
     def log(self, message, ex=None):
-        """Uniwersalna metoda logowania"""
         if ex:
             self.logger.error(f"{message}\n{traceback.format_exc()}")
         else:
             self.logger.info(message)
 
     def _decrypt(self, data):
-        """Deszyfrowanie danych NP"""
         key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
         decrypted = bytearray(data)
         for i in range(len(decrypted)):
@@ -36,7 +34,6 @@ class NapiProjektKatalog:
         return bytes(decrypted)
 
     def _convert_microdvd_to_srt(self, content):
-        """Ulepszona konwersja do formatu SRT"""
         try:
             if not content:
                 return None
@@ -71,7 +68,6 @@ class NapiProjektKatalog:
             return None
 
     def _format_time(self, seconds):
-        """Formatowanie czasu do formatu SRT"""
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         seconds_val = int(seconds % 60)
@@ -79,7 +75,6 @@ class NapiProjektKatalog:
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
     def _parse_duration(self, duration_str):
-        """Parsowanie czasu trwania w formacie HH:MM:SS.fff na sekundy"""
         try:
             if not duration_str or duration_str.lower() == 'b.d.':
                 return 0
@@ -97,7 +92,6 @@ class NapiProjektKatalog:
             return 0
 
     def _handle_old_format(self, data):
-        """Rozszerzona obsługa starych formatów"""
         try:
             try:
                 text = data.decode('utf-8-sig')
@@ -144,7 +138,6 @@ class NapiProjektKatalog:
         return None
 
     def download(self, md5hash):
-        """Pobieranie napisów z wieloma próbami"""
         for attempt in range(3):
             try:
                 params = {
@@ -200,7 +193,6 @@ class NapiProjektKatalog:
         return None
 
     def search(self, item, imdb_id):
-        """Wyszukiwanie napisów w katalogu"""
         subtitle_list = []
         try:
             title_to_find = item.get('tvshow') or item.get('title')
@@ -266,7 +258,6 @@ class NapiProjektKatalog:
             return []
 
     def _build_detail_url(self, item, href):
-        """Budowanie URL do szczegółów napisów"""
         if item.get('tvshow') and item.get('season') and item.get('episode'):
             match = re.search(r'napisy-(\d+)-(.*)', href)
             if match:
@@ -274,14 +265,28 @@ class NapiProjektKatalog:
                 season = str(item['season']).zfill(2)
                 episode = str(item['episode']).zfill(2)
                 return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-s{season}e{episode}"
+        
+        # Dla filmów
+        match = re.search(r'napisy-(\d+)-(.*)', href)
+        if match:
+            napi_id, slug = match.groups()
+            return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}"
+        
         return urllib.parse.urljoin(self.base_url, href)
 
     def _get_subtitles_from_detail(self, detail_url):
-        """Pobieranie listy napisów ze strony szczegółów - zaktualizowana wersja"""
         subs = []
         try:
+            # Najpierw upewnijmy się, że mamy prawidłowy URL
+            if not detail_url.startswith('https://www.napiprojekt.pl/napisy1,1,1-dla-'):
+                # Jeśli nie, spróbujmy przekonwertować URL
+                match = re.search(r'napisy-(\d+)-(.*)', detail_url)
+                if match:
+                    napi_id, slug = match.groups()
+                    detail_url = f"https://www.napiprojekt.pl/napisy1,1,1-dla-{napi_id}-{slug}"
+
             req = urllib.request.Request(
-                detail_url, 
+                detail_url,
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -289,30 +294,33 @@ class NapiProjektKatalog:
                     'Referer': 'https://www.napiprojekt.pl/'
                 }
             )
+            
             with urllib.request.urlopen(req, timeout=15) as response:
                 detail_page = response.read().decode('utf-8')
-                
+            
             soup = BeautifulSoup(detail_page, 'lxml')
             
-            # Znajdź główną tabelę z napisami
-            table = soup.find('table', {'class': 'blueTable'})
+            # Szukamy właściwej tabeli z napisami
+            table = soup.find('table', {'id': 'tableSubtitles'})
             if not table:
-                self.log("Nie znaleziono tabeli z napisami!")
-                return subs
-                
-            # Przetwarzaj wiersze tabeli (pomijając nagłówek)
-            for row in table.find_all('tr')[1:]:
+                table = soup.find('table', {'class': 'subtitlesTable'})
+                if not table:
+                    self.log(f"Nie znaleziono tabeli z napisami na stronie: {detail_url}")
+                    return subs
+            
+            # Przetwarzanie wierszy tabeli
+            for row in table.find_all('tr')[1:]:  # Pomijamy nagłówek
                 try:
                     cols = row.find_all('td')
-                    if len(cols) < 7:  # Minimalna liczba kolumn
+                    if len(cols) < 7:
                         continue
-                        
-                    # Znajdź link do napisów
+                    
+                    # Link do pobrania napisów
                     link = cols[0].find('a', href=lambda x: x and x.startswith('napiprojekt:'))
                     if not link:
                         continue
-                        
-                    # Pobierz dane z kolumn
+                    
+                    # Pobieramy dane z kolumn
                     file_name = cols[0].get_text(strip=True)
                     size = cols[1].get_text(strip=True)
                     fps = cols[2].get_text(strip=True)
@@ -321,15 +329,12 @@ class NapiProjektKatalog:
                     added_date = cols[5].get_text(strip=True)
                     downloads = cols[6].get_text(strip=True)
                     
-                    # Konwersja czasu trwania
-                    duration_sec = self._parse_duration(duration)
-                    
                     subs.append({
                         'language': 'pol',
                         'label': f"{file_name} | {duration} | FPS: {fps} | Pobrania: {downloads}",
                         'link_hash': link['href'].replace('napiprojekt:', ''),
                         'duration_text': duration,
-                        'duration_sec': duration_sec,
+                        'duration_sec': self._parse_duration(duration),
                         'fps': fps,
                         'added_date': added_date,
                         'downloads': downloads,
@@ -337,9 +342,10 @@ class NapiProjektKatalog:
                         'size': size
                     })
                 except Exception as e:
-                    self.log(f"Error processing row: {str(e)}")
+                    self.log(f"Błąd przetwarzania wiersza: {str(e)}")
                     continue
                     
         except Exception as e:
-            self.log(f"Detail page error: {detail_url}", e)
+            self.log(f"Błąd podczas przetwarzania strony szczegółów: {detail_url}\n{str(e)}")
+        
         return subs
