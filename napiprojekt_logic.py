@@ -79,25 +79,53 @@ class NapiProjektKatalog:
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
     def _parse_duration(self, duration_text):
+        """Ulepszone parsowanie czasu z różnych formatów"""
+        if not duration_text:
+            return None
+            
         try:
+            # Format HH:MM:SS.mmm
+            if '.' in duration_text:
+                h_m_s, ms = duration_text.split('.')
+                ms = float(f"0.{ms}")
+                parts = list(map(float, h_m_s.split(':')))
+                if len(parts) == 3:
+                    return parts[0] * 3600 + parts[1] * 60 + parts[2] + ms
+                elif len(parts) == 2:
+                    return parts[0] * 60 + parts[1] + ms
+            
+            # Format HH:MM:SS
             parts = list(map(float, duration_text.split(':')))
             if len(parts) == 3:
                 return parts[0] * 3600 + parts[1] * 60 + parts[2]
             elif len(parts) == 2:
                 return parts[0] * 60 + parts[1]
+                
             return None
-        except:
+        except Exception as e:
+            self.logger.warning(f"Failed to parse duration: {duration_text} - {str(e)}")
             return None
 
     def _calculate_match_score(self, video_duration, sub_duration, video_fps=None, sub_fps=None):
-        """Nowa metoda scoringowa - im mniejszy wynik, tym lepsze dopasowanie"""
-        if not video_duration or not sub_duration:
-            return float('inf')
+        """Nowa, bardziej odporna metoda scoringowa"""
+        # Brak danych wideo = neutralny score
+        if video_duration is None:
+            return 100
             
+        # Brak danych napisów = bardzo zły score
+        if sub_duration is None:
+            return float('inf')
+        
+        # Oblicz różnicę czasu (ważona 80%)
         duration_diff = abs(video_duration - sub_duration)
+        
+        # Oblicz różnicę FPS (ważona 20%, jeśli dostępne)
         fps_diff = abs((video_fps or 0) - (sub_fps or 0)) if video_fps and sub_fps else 0
         
+        # Oblicz końcowy score (im mniejszy, tym lepszy)
         score = (duration_diff * 0.8) + (fps_diff * 0.2)
+        
+        self.logger.debug(f"Scoring: video={video_duration}s, sub={sub_duration}s → score={score:.2f}")
         return score
 
     def _extract_fps_from_label(self, label):
@@ -262,8 +290,10 @@ class NapiProjektKatalog:
                     self.log("Error processing block", e)
                     continue
             
+            # Sortowanie po score (im mniejszy, tym lepszy)
             subtitle_list.sort(key=lambda x: x['score'])
             
+            # Logowanie najlepszych wyników
             for i, sub in enumerate(subtitle_list[:15]):
                 self.log(
                     f"Subtitle #{i+1}: {sub['label']} | "
@@ -301,44 +331,59 @@ class NapiProjektKatalog:
     def _get_subtitles_from_detail(self, detail_url, video_duration=None, video_fps=None):
         subs = []
         try:
-            req = urllib.request.Request(
-                detail_url, 
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-                }
-            )
-            with urllib.request.urlopen(req, timeout=15) as response:
-                soup = BeautifulSoup(response.read(), 'lxml')
-
-            for row in soup.select('tbody > tr'):
-                link = row.find('a', href=re.compile(r'napiprojekt:'))
-                if not link:
-                    continue
-                    
-                cols = row.find_all('td')
-                if len(cols) < 5:
-                    continue
-
-                duration_text = cols[3].get_text(strip=True)
-                sub_duration = self._parse_duration(duration_text)
-                sub_fps = self._extract_fps_from_label(cols[2].get_text(strip=True))
+            # Sprawdzanie kolejnych stron (1, 2, 3...)
+            page = 1
+            while True:
+                # Zamiana numeru strony w URL (np. napisy1 → napisy2)
+                page_url = detail_url.replace('napisy1,', f'napisy{page},')
                 
-                score = self._calculate_match_score(
-                    video_duration,
-                    sub_duration,
-                    video_fps,
-                    sub_fps
+                req = urllib.request.Request(
+                    page_url,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'}
                 )
+                
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    soup = BeautifulSoup(response.read(), 'lxml')
+                    
+                    # Jeśli strona nie zawiera napisów, przerywamy pętlę
+                    rows = soup.select('tbody > tr')
+                    if not rows:
+                        break
+                        
+                    # Przetwarzanie napisów z bieżącej strony
+                    for row in rows:
+                        link = row.find('a', href=re.compile(r'napiprojekt:'))
+                        if not link:
+                            continue
+                            
+                        cols = row.find_all('td')
+                        if len(cols) < 5:
+                            continue
 
-                subs.append({
-                    'language': 'pol',
-                    'label': f"{cols[1].get_text(strip=True)} | {duration_text}",
-                    'link_hash': link['href'].replace('napiprojekt:', ''),
-                    'score': score,
-                    '_duration': sub_duration,
-                    '_fps': sub_fps
-                })
+                        duration_text = cols[3].get_text(strip=True)
+                        sub_duration = self._parse_duration(duration_text)
+                        sub_fps = self._extract_fps_from_label(cols[2].get_text(strip=True))
+                        
+                        score = self._calculate_match_score(
+                            video_duration,
+                            sub_duration,
+                            video_fps,
+                            sub_fps
+                        )
+
+                        subs.append({
+                            'language': 'pol',
+                            'label': f"{cols[1].get_text(strip=True)} | {duration_text}",
+                            'link_hash': link['href'].replace('napiprojekt:', ''),
+                            'score': score,
+                            '_duration': sub_duration,
+                            '_fps': sub_fps
+                        })
+                    
+                    page += 1
+                    time.sleep(1)  # Ograniczenie zapytań
 
         except Exception as e:
-            self.log(f"Detail page error: {detail_url}", e)
+            self.log(f"Error processing page {page}: {str(e)}")
+        
         return subs
