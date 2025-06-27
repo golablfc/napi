@@ -22,14 +22,12 @@ class NapiProjektKatalog:
         self.logger.info("NapiProjektKatalog initialized")
 
     def log(self, message, ex=None):
-        """Uniwersalna metoda logowania"""
         if ex:
             self.logger.error(f"{message}\n{traceback.format_exc()}")
         else:
             self.logger.info(message)
 
     def _decrypt(self, data):
-        """Deszyfrowanie danych NP"""
         key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
         decrypted = bytearray(data)
         for i in range(len(decrypted)):
@@ -38,7 +36,6 @@ class NapiProjektKatalog:
         return bytes(decrypted)
 
     def _convert_microdvd_to_srt(self, content):
-        """Konwersja formatu MicroDVD do SRT"""
         try:
             if not content:
                 return None
@@ -76,7 +73,6 @@ class NapiProjektKatalog:
             return None
 
     def _format_time(self, seconds):
-        """Formatowanie czasu do formatu SRT"""
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         seconds_val = int(seconds % 60)
@@ -84,7 +80,6 @@ class NapiProjektKatalog:
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
     def _handle_old_format(self, data):
-        """Obsługa starych formatów napisów"""
         try:
             try:
                 text = data.decode('utf-8-sig')
@@ -131,7 +126,6 @@ class NapiProjektKatalog:
         return None
 
     def download(self, md5hash):
-        """Pobieranie napisów"""
         for attempt in range(3):
             try:
                 params = {
@@ -187,7 +181,6 @@ class NapiProjektKatalog:
         return None
 
     def search(self, item, imdb_id):
-        """Wyszukiwanie napisów w katalogu"""
         subtitle_list = []
         try:
             title_to_find = item.get('tvshow') or item.get('title') or imdb_id
@@ -257,20 +250,24 @@ class NapiProjektKatalog:
         if match:
             napi_id, slug = match.groups()
             
-            # Usuwamy istniejący rok z slug jeśli jest
-            slug = re.sub(r'-\d{4}\)?$', '', slug)
+            # Całkowicie usuwamy istniejące nawiasy i rok z końca slug
+            slug = re.sub(r'[-\s]*\(?\d{4}\)?$', '', slug).strip('-')
             
-            # Dla seriali
+            # Budujemy podstawowy URL
+            base_url = f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}"
+            
+            # Dla seriali dodajemy sezon i odcinek
             if item.get('tvshow') and item.get('season') and item.get('episode'):
                 season = str(item['season']).zfill(2)
                 episode = str(item['episode']).zfill(2)
-                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-s{season}e{episode}"
-            # Dla filmów
+                return f"{base_url}-s{season}e{episode}"
+            # Dla filmów dodajemy rok tylko jeśli jest dostępny
             elif item.get('year'):
-                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-({item['year']})"
+                return f"{base_url}-({item['year']})"
             # Dla przypadków bez roku
             else:
-                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}"
+                return base_url
+                
         return urllib.parse.urljoin(self.base_url, href)
 
     def _get_subtitles_from_detail(self, detail_url):
