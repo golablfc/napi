@@ -8,7 +8,6 @@ import urllib.parse
 import time
 from waitress import serve
 
-# Konfiguracja logowania
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -55,7 +54,7 @@ def index():
     return jsonify({
         "message": "NapiProjekt Stremio Addon (Python)",
         "manifest": f"{request.url_root}manifest.json",
-        "version": "1.3.0"  # Updated version
+        "version": "1.3.0"
     })
 
 @app.route('/manifest.json')
@@ -63,7 +62,7 @@ def manifest():
     return jsonify({
         "id": "org.stremio.napiprojekt.python",
         "version": "1.3.0",
-        "name": "NapiProjekt PL",  # Shorter name for display
+        "name": "NapiProjekt PL",
         "description": "Napisy PL z NapiProjekt - czas trwania, FPS, pobrania",
         "logo": "https://i.imgur.com/h5mZ4pB.png",
         "resources": ["subtitles"],
@@ -98,10 +97,20 @@ def get_subtitles(content_type, imdb_id_with_params):
                 ).json()
                 
                 if omdb_response.get('Response') == 'True':
-                    item['title'] = omdb_response.get('Title', '').strip()
-                    item['year'] = omdb_response.get('Year', '').strip()
+                    title = omdb_response.get('Title', '').strip()
+                    year = omdb_response.get('Year', '').split('–')[0].strip()
+                    
                     if omdb_response.get('Type') == 'series':
-                        item['tvshow'] = item.pop('title', None)
+                        item['tvshow'] = title
+                        if 'season' not in item:
+                            item['season'] = '1'
+                    else:
+                        item['title'] = title
+                    
+                    if year:
+                        item['year'] = year
+                        
+                    logger.info(f"OMDB data: {title} ({year})")
             except Exception as e:
                 logger.error(f"OMDB API error: {str(e)}")
 
@@ -111,28 +120,19 @@ def get_subtitles(content_type, imdb_id_with_params):
             if not item.get('tvshow'):
                 item['tvshow'] = item.pop('title', base_imdb_id)
         
+        logger.info(f"Searching with item data: {item}")
+        
         found_subtitles = napi_helper.search(item, base_imdb_id)
         stremio_subtitles = []
         
         for sub in found_subtitles:
             sub_id = f"{base_imdb_id}_{sub['link_hash']}_{sub['language']}"
             
-            # Build compact metadata string
-            meta_parts = []
-            if sub.get('duration_text') and sub['duration_text'].lower() != 'b.d.':
-                meta_parts.append(f"{sub['duration_text']}")
-            if sub.get('fps'):
-                meta_parts.append(f"{sub['fps']}fps")
-            if sub.get('downloads'):
-                meta_parts.append(f"⬇{sub['downloads']}")
-            
-            metadata = " ".join(meta_parts) if meta_parts else "NapiProjekt"
-            
             stremio_subtitles.append({
                 "id": sub_id,
                 "url": f"{request.url_root}subtitles/download/{sub_id}.srt",
                 "lang": sub['language'],
-                "name": metadata,  # This will be shown next to language
+                "name": sub.get('label', 'NapiProjekt'),
             })
             
         logger.info(f"Found {len(stremio_subtitles)} subtitles for {base_imdb_id}")
