@@ -152,7 +152,7 @@ class NapiProjektKatalog:
                     self.download_url, 
                     data=data,
                     headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                     }
                 )
                 
@@ -212,7 +212,7 @@ class NapiProjektKatalog:
             
             post_data = urllib.parse.urlencode(post).encode('utf-8')
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'X-Requested-With': 'XMLHttpRequest'
             }
@@ -277,20 +277,12 @@ class NapiProjektKatalog:
     def _get_subtitles_from_detail(self, detail_url):
         subs = []
         try:
-            # Najpierw upewnijmy się, że mamy prawidłowy URL
-            if not detail_url.startswith('https://www.napiprojekt.pl/napisy1,1,1-dla-'):
-                # Jeśli nie, spróbujmy przekonwertować URL
-                match = re.search(r'napisy-(\d+)-(.*)', detail_url)
-                if match:
-                    napi_id, slug = match.groups()
-                    detail_url = f"https://www.napiprojekt.pl/napisy1,1,1-dla-{napi_id}-{slug}"
-
             req = urllib.request.Request(
                 detail_url,
                 headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'pl,en-US;q=0.7,en;q=0.3',
+                    'Accept-Language': 'pl,en-US;q=0.9,en;q=0.8',
                     'Referer': 'https://www.napiprojekt.pl/'
                 }
             )
@@ -300,52 +292,68 @@ class NapiProjektKatalog:
             
             soup = BeautifulSoup(detail_page, 'lxml')
             
-            # Szukamy właściwej tabeli z napisami
-            table = soup.find('table', {'id': 'tableSubtitles'})
-            if not table:
-                table = soup.find('table', {'class': 'subtitlesTable'})
-                if not table:
-                    self.log(f"Nie znaleziono tabeli z napisami na stronie: {detail_url}")
-                    return subs
+            # Nowe podejście do znalezienia napisów
+            subtitles_container = soup.find('div', {'id': 'subtitlesList'})
+            if not subtitles_container:
+                subtitles_container = soup.find('div', {'class': 'subtitles-container'})
             
-            # Przetwarzanie wierszy tabeli
-            for row in table.find_all('tr')[1:]:  # Pomijamy nagłówek
-                try:
-                    cols = row.find_all('td')
-                    if len(cols) < 7:
+            if subtitles_container:
+                subtitle_items = subtitles_container.find_all('div', class_='subtitle-item')
+                
+                for item in subtitle_items:
+                    try:
+                        link = item.find('a', href=lambda x: x and 'napiprojekt:' in x)
+                        if not link:
+                            continue
+                            
+                        cols = item.find_all('div', class_='subtitle-col')
+                        if len(cols) >= 5:
+                            subs.append({
+                                'language': 'pol',
+                                'label': f"{cols[0].get_text(strip=True)} | {cols[3].get_text(strip=True)}",
+                                'link_hash': link['href'].replace('napiprojekt:', ''),
+                                'duration_text': cols[3].get_text(strip=True),
+                                'duration_sec': self._parse_duration(cols[3].get_text(strip=True)),
+                                'fps': cols[2].get_text(strip=True),
+                                'downloads': cols[4].get_text(strip=True),
+                                'translator': cols[5].get_text(strip=True) if len(cols) > 5 else '',
+                                'size': cols[1].get_text(strip=True)
+                            })
+                    except Exception as e:
+                        self.log(f"Error processing subtitle item: {str(e)}")
                         continue
-                    
-                    # Link do pobrania napisów
-                    link = cols[0].find('a', href=lambda x: x and x.startswith('napiprojekt:'))
-                    if not link:
-                        continue
-                    
-                    # Pobieramy dane z kolumn
-                    file_name = cols[0].get_text(strip=True)
-                    size = cols[1].get_text(strip=True)
-                    fps = cols[2].get_text(strip=True)
-                    duration = cols[3].get_text(strip=True)
-                    translator = cols[4].get_text(strip=True)
-                    added_date = cols[5].get_text(strip=True)
-                    downloads = cols[6].get_text(strip=True)
-                    
-                    subs.append({
-                        'language': 'pol',
-                        'label': f"{file_name} | {duration} | FPS: {fps} | Pobrania: {downloads}",
-                        'link_hash': link['href'].replace('napiprojekt:', ''),
-                        'duration_text': duration,
-                        'duration_sec': self._parse_duration(duration),
-                        'fps': fps,
-                        'added_date': added_date,
-                        'downloads': downloads,
-                        'translator': translator,
-                        'size': size
-                    })
-                except Exception as e:
-                    self.log(f"Błąd przetwarzania wiersza: {str(e)}")
-                    continue
-                    
+            else:
+                # Stara wersja strony
+                table = soup.find('table', {'id': 'tableSubtitles'})
+                if not table:
+                    table = soup.find('table', {'class': 'subtitlesTable'})
+                
+                if table:
+                    for row in table.find_all('tr')[1:]:
+                        try:
+                            cols = row.find_all('td')
+                            if len(cols) >= 7:
+                                link = cols[0].find('a', href=lambda x: x and 'napiprojekt:' in x)
+                                if link:
+                                    subs.append({
+                                        'language': 'pol',
+                                        'label': f"{cols[0].get_text(strip=True)} | {cols[3].get_text(strip=True)}",
+                                        'link_hash': link['href'].replace('napiprojekt:', ''),
+                                        'duration_text': cols[3].get_text(strip=True),
+                                        'duration_sec': self._parse_duration(cols[3].get_text(strip=True)),
+                                        'fps': cols[2].get_text(strip=True),
+                                        'downloads': cols[6].get_text(strip=True),
+                                        'translator': cols[4].get_text(strip=True),
+                                        'size': cols[1].get_text(strip=True)
+                                    })
+                        except Exception as e:
+                            self.log(f"Error processing table row: {str(e)}")
+                            continue
+            
+            if not subs:
+                self.log(f"No subtitles found on page. Full page content:\n{detail_page}")
+                
         except Exception as e:
-            self.log(f"Błąd podczas przetwarzania strony szczegółów: {detail_url}\n{str(e)}")
+            self.log(f"Error processing detail page: {str(e)}")
         
         return subs
