@@ -395,9 +395,6 @@ def internal_error(error):
 
 
 if __name__ == '__main__':
-
-    logger.info("Starting Stremio NapiProjekt addon")
-
-    app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB limit
-
+    logger.info("Starting optimized Stremio NapiProjekt addon")
+    app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
     serve(app, host='0.0.0.0', port=7002)
