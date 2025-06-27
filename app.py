@@ -79,7 +79,7 @@ def manifest():
         "version": "1.3.0",
         "name": "NapiProjekt PL",
         "description": "Napisy PL z NapiProjekt - czas trwania, FPS, pobrania",
-        "logo": "https://i.imgur.com/h5mZ4pB.png",
+        "logo": "https://d3npyywa6qnolf.cloudfront.net/prod/user/337361/eyJ1cmwiOiJodHRwczpcL1wvcGF0cm9uaXRlLnBsXC91cGxvYWRcL3VzZXJcLzMzNzM2MVwvYXZhdGFyX29yaWcuanBnPzE1ODk5NjY3NjMiLCJlZGl0cyI6eyJyZXNpemUiOnsid2lkdGgiOjI5MH0sInRvRm9ybWF0Ijoid2VicCJ9fQ%3D%3D/wIDQ1%2FJ8QvTzsI29KHkeWnO5G0BuCBY00wpksnlpJfs%3D",
         "resources": ["subtitles"],
         "types": ["movie", "series"],
         "catalogs": [],
