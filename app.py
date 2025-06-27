@@ -8,7 +8,6 @@ import urllib.parse
 import time
 from waitress import serve
 
-# Konfiguracja logowania
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -25,12 +24,10 @@ napi_helper = NapiProjektKatalog()
 OMDB_API_KEY = os.environ.get('OMDB_API_KEY', 'fdc33d1c')
 
 def fill_item_from_name(name, item):
-    """Parsuje nazwę pliku wideo i wypełnia metadane"""
     if not name:
         return
         
     try:
-        # Wzorzec dla seriali: Nazwa.S01E01.xxx
         tv_match = re.search(r'(.*?)[. ](?:S|s)(\d{1,2})(?:E|e)(\d{1,2}).*', name, re.IGNORECASE)
         if tv_match:
             item['tvshow'] = tv_match.group(1).replace(".", " ").strip()
@@ -38,7 +35,6 @@ def fill_item_from_name(name, item):
             item['episode'] = str(int(tv_match.group(3)))
             return
 
-        # Wzorzec dla filmów: Nazwa (2023).xxx
         movie_match = re.search(r'(.+?)[.\s\-_\[\]()]*(\d{4})(?!\d)', name, re.IGNORECASE)
         if movie_match:
             item['title'] = movie_match.group(1).replace(".", " ").replace("_", " ").strip()
@@ -47,7 +43,6 @@ def fill_item_from_name(name, item):
         logger.error(f"Error parsing filename: {str(e)}")
 
 def parse_video_params(decoded_id):
-    """Parsuje parametry wideo z URL (videoSize, videoHash)"""
     params = {}
     if '/' in decoded_id:
         params_part = decoded_id.split('/', 1)[1]
@@ -59,7 +54,6 @@ def parse_video_params(decoded_id):
 
 @app.after_request
 def after_request(response):
-    """Dodaje nagłówki CORS do odpowiedzi"""
     response.headers.add('Access-Control-Allow-Origin', '*')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
@@ -67,22 +61,20 @@ def after_request(response):
 
 @app.route('/')
 def index():
-    """Strona główna z informacjami o addonie"""
     return jsonify({
         "message": "NapiProjekt Stremio Addon (Python)",
         "manifest": f"{request.url_root}manifest.json",
-        "version": "1.4.0"
+        "version": "1.5.0"
     })
 
 @app.route('/manifest.json')
 def manifest():
-    """Zwraca manifest addona w formacie JSON"""
     return jsonify({
         "id": "org.stremio.napiprojekt.python",
-        "version": "1.4.0",
-        "name": "NapiProjekt PL",
-        "description": "Napisy PL z NapiProjekt - czas trwania, FPS, pobrania",
-        "logo": "https://i.imgur.com/h5mZ4pB.png",
+        "version": "1.5.0",
+        "name": "NapiProjekt PL [AutoMatch]",
+        "description": "Napisy PL automatycznie dopasowane do czasu trwania filmu/odcinka | Najlepsze dopasowanie zawsze na górze listy",
+        "logo": "https://d3npyywa6qnolf.cloudfront.net/prod/user/337361/eyJ1cmwiOiJodHRwczpcL1wvcGF0cm9uaXRlLnBsXC91cGxvYWRcL3VzZXJcLzMzNzM2MVwvYXZhdGFyX29yaWcuanBnPzE1ODk5NjY3NjMiLCJlZGl0cyI6eyJyZXNpemUiOnsid2lkdGgiOjI5MCwib3B0aW9ucyI6eyJxdWFsaXR5Ijo5NX19LCJ0b0Zvcm1hdCI6ImpwZWcifX0%3D/CNr3puLsC%2BLYwc6%2BViC0GgARXLAFaxnY0gcyJYaIhHE%3D",
         "resources": ["subtitles"],
         "types": ["movie", "series"],
         "catalogs": [],
@@ -95,12 +87,10 @@ def manifest():
 
 @app.route('/subtitles/<content_type>/<path:imdb_id_with_params>.json')
 def get_subtitles(content_type, imdb_id_with_params):
-    """Główny endpoint do wyszukiwania napisów"""
     try:
         item = {}
         decoded_id = urllib.parse.unquote(imdb_id_with_params)
         
-        # Parsowanie IMDB ID (ttXXXXXXX)
         imdb_match = re.match(r'^(tt\d{7,8})', decoded_id)
         if not imdb_match:
             logger.error(f"Invalid IMDB ID format: {decoded_id}")
@@ -109,16 +99,13 @@ def get_subtitles(content_type, imdb_id_with_params):
         base_imdb_id = imdb_match.group(1)
         item['imdb_id'] = base_imdb_id
         
-        # Parsowanie parametrów wideo
         video_params = parse_video_params(decoded_id)
         logger.info(f"Video params: {video_params}")
         
-        # Pobieranie nazwy pliku z parametrów żądania
         video_filename = request.args.get('videoFileName')
         if video_filename:
             fill_item_from_name(video_filename, item)
         
-        # Pobieranie metadanych z OMDB jeśli brak tytułu
         if not item.get('title') and not item.get('tvshow'):
             try:
                 omdb_response = requests.get(
@@ -144,7 +131,6 @@ def get_subtitles(content_type, imdb_id_with_params):
             except Exception as e:
                 logger.error(f"OMDB API error: {str(e)}")
 
-        # Parsowanie sezonu i odcinka dla seriali
         if content_type == 'series':
             season_episode_match = re.search(r'[:/](\d+)[:/](\d+)', decoded_id)
             if season_episode_match:
@@ -153,10 +139,16 @@ def get_subtitles(content_type, imdb_id_with_params):
                 if not item.get('tvshow'):
                     item['tvshow'] = item.pop('title', base_imdb_id)
         
-        logger.info(f"Searching with item data: {item}")
+        video_duration = None
+        if video_params.get('videoduration'):
+            try:
+                video_duration = float(video_params['videoduration'])
+            except ValueError:
+                logger.warning(f"Invalid videoDuration: {video_params.get('videoduration')}")
         
-        # Wyszukiwanie napisów
-        found_subtitles = napi_helper.search(item, base_imdb_id)
+        logger.info(f"Searching with item data: {item}, video_duration: {video_duration}s")
+        
+        found_subtitles = napi_helper.search(item, base_imdb_id, video_duration)
         stremio_subtitles = []
         
         for sub in found_subtitles:
@@ -178,7 +170,6 @@ def get_subtitles(content_type, imdb_id_with_params):
 
 @app.route('/subtitles/download/<sub_id>.srt')
 def download_subtitle_file(sub_id):
-    """Endpoint do pobierania napisów"""
     try:
         parts = sub_id.split('_')
         if len(parts) < 3:
