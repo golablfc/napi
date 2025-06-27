@@ -140,15 +140,23 @@ def get_subtitles(content_type, imdb_id_with_params):
                     item['tvshow'] = item.pop('title', base_imdb_id)
         
         video_duration = None
+        video_fps = None
+        
         if video_params.get('videoduration'):
             try:
                 video_duration = float(video_params['videoduration'])
             except ValueError:
                 logger.warning(f"Invalid videoDuration: {video_params.get('videoduration')}")
         
-        logger.info(f"Searching with item data: {item}, video_duration: {video_duration}s")
+        if video_params.get('fps'):
+            try:
+                video_fps = float(video_params['fps'])
+            except ValueError:
+                logger.warning(f"Invalid FPS: {video_params.get('fps')}")
         
-        found_subtitles = napi_helper.search(item, base_imdb_id, video_duration)
+        logger.info(f"Searching with item data: {item}, video_duration: {video_duration}s, FPS: {video_fps}")
+        
+        found_subtitles = napi_helper.search(item, base_imdb_id, video_duration, video_fps)
         stremio_subtitles = []
         
         for sub in found_subtitles:
@@ -158,7 +166,7 @@ def get_subtitles(content_type, imdb_id_with_params):
                 "id": sub_id,
                 "url": f"{request.url_root}subtitles/download/{sub_id}.srt",
                 "lang": sub['language'],
-                "name": sub.get('label', 'NapiProjekt'),
+                "name": f"{sub.get('label', 'NapiProjekt')} [Score: {sub['score']:.1f}]",
             })
             
         logger.info(f"Found {len(stremio_subtitles)} subtitles for {base_imdb_id}")
