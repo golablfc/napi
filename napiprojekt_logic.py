@@ -22,14 +22,12 @@ class NapiProjektKatalog:
         self.logger.info("NapiProjektKatalog initialized")
 
     def log(self, message, ex=None):
-        """Uniwersalna metoda logowania"""
         if ex:
             self.logger.error(f"{message}\n{traceback.format_exc()}")
         else:
             self.logger.info(message)
 
     def _decrypt(self, data):
-        """Deszyfrowanie danych NP"""
         key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
         decrypted = bytearray(data)
         for i in range(len(decrypted)):
@@ -38,7 +36,6 @@ class NapiProjektKatalog:
         return bytes(decrypted)
 
     def _convert_microdvd_to_srt(self, content):
-        """Ulepszona konwersja do formatu SRT"""
         try:
             if not content:
                 return None
@@ -76,7 +73,6 @@ class NapiProjektKatalog:
             return None
 
     def _format_time(self, seconds):
-        """Formatowanie czasu do formatu SRT"""
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         seconds_val = int(seconds % 60)
@@ -84,7 +80,6 @@ class NapiProjektKatalog:
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
     def _handle_old_format(self, data):
-        """Rozszerzona obsługa starych formatów"""
         try:
             try:
                 text = data.decode('utf-8-sig')
@@ -131,7 +126,6 @@ class NapiProjektKatalog:
         return None
 
     def download(self, md5hash):
-        """Pobieranie napisów z wieloma próbami"""
         for attempt in range(3):
             try:
                 params = {
@@ -187,15 +181,10 @@ class NapiProjektKatalog:
         return None
 
     def search(self, item, imdb_id):
-        """Wyszukiwanie napisów w katalogu"""
         subtitle_list = []
         try:
-            title_to_find = item.get('tvshow') or item.get('title') or f"tt{imdb_id}"
+            title_to_find = item.get('tvshow') or item.get('title') or imdb_id
             
-            if not title_to_find:
-                self.log(f"No title for: {imdb_id}")
-                return subtitle_list
-                
             query_kind = 1 if item.get('tvshow') else 2
             query_year = item.get('year', '').split('–')[0] if item.get('tvshow') else item.get('year', '')
             
@@ -205,6 +194,8 @@ class NapiProjektKatalog:
                 'queryYear': str(query_year),
                 'associate': imdb_id if imdb_id.startswith('tt') else ''
             }
+            
+            self.log(f"Searching NapiProjekt with params: {post}")
             
             post_data = urllib.parse.urlencode(post).encode('utf-8')
             headers = {
@@ -239,7 +230,7 @@ class NapiProjektKatalog:
                             if not detail_url: 
                                 continue
                             
-                            self.log(f"Found: {detail_url}")
+                            self.log(f"Found detail page: {detail_url}")
                             subs = self._get_subtitles_from_detail(detail_url)
                             subtitle_list.extend(subs)
                 except Exception as e:
@@ -254,18 +245,24 @@ class NapiProjektKatalog:
             return []
 
     def _build_detail_url(self, item, href):
-        """Budowanie URL do szczegółów napisów"""
-        if item.get('tvshow') and item.get('season') and item.get('episode'):
-            match = re.search(r'napisy-(\d+)-(.*)', href)
-            if match:
-                napi_id, slug = match.groups()
+        """Budowanie URL do szczegółów napisów w formacie /napisy1,1,1-dla-[id]-[tytuł]"""
+        match = re.search(r'napisy-(\d+)-(.*)', href)
+        if match:
+            napi_id, slug = match.groups()
+            title = item.get('tvshow') or item.get('title') or ''
+            year = f"-({item['year']})" if item.get('year') else ''
+            
+            # Dla seriali dodajemy informacje o sezonie i odcinku
+            if item.get('tvshow') and item.get('season') and item.get('episode'):
                 season = str(item['season']).zfill(2)
                 episode = str(item['episode']).zfill(2)
                 return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-s{season}e{episode}"
+            # Dla filmów używamy podstawowego formatu
+            else:
+                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}{year}"
         return urllib.parse.urljoin(self.base_url, href)
 
     def _get_subtitles_from_detail(self, detail_url):
-        """Pobieranie listy napisów ze strony szczegółów"""
         subs = []
         try:
             req = urllib.request.Request(
