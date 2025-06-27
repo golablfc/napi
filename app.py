@@ -144,13 +144,17 @@ def get_subtitles(content_type, imdb_id_with_params):
         
         if video_params.get('videoduration'):
             try:
-                video_duration = float(video_params['videoduration'])
-            except ValueError:
-                logger.warning(f"Invalid videoDuration: {video_params.get('videoduration')}")
+                # Konwersja czasu z formatu HH:MM:SS na sekundy
+                h, m, s = map(float, video_params['videoduration'].split(':'))
+                video_duration = h * 3600 + m * 60 + s
+                logger.info(f"Parsed video duration: {video_params['videoduration']} → {video_duration}s")
+            except Exception as e:
+                logger.warning(f"Invalid videoDuration: {video_params.get('videoduration')} - {str(e)}")
         
         if video_params.get('fps'):
             try:
                 video_fps = float(video_params['fps'])
+                logger.info(f"Parsed video FPS: {video_fps}")
             except ValueError:
                 logger.warning(f"Invalid FPS: {video_params.get('fps')}")
         
