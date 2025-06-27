@@ -201,7 +201,8 @@ class NapiProjektKatalog:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest'
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': 'https://www.napiprojekt.pl/'
             }
             
             req = urllib.request.Request(
@@ -245,52 +246,76 @@ class NapiProjektKatalog:
             return []
 
     def _build_detail_url(self, item, href):
-        """Budowanie URL do szczegółów napisów w formacie /napisy1,1,1-dla-[id]-[tytuł]"""
         match = re.search(r'napisy-(\d+)-(.*)', href)
         if match:
             napi_id, slug = match.groups()
             title = item.get('tvshow') or item.get('title') or ''
             year = f"-({item['year']})" if item.get('year') else ''
             
-            # Dla seriali dodajemy informacje o sezonie i odcinku
             if item.get('tvshow') and item.get('season') and item.get('episode'):
                 season = str(item['season']).zfill(2)
                 episode = str(item['episode']).zfill(2)
                 return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-s{season}e{episode}"
-            # Dla filmów używamy podstawowego formatu
             else:
                 return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}{year}"
         return urllib.parse.urljoin(self.base_url, href)
 
     def _get_subtitles_from_detail(self, detail_url):
+        """Pobieranie listy napisów ze strony szczegółów"""
         subs = []
         try:
-            req = urllib.request.Request(
-                detail_url, 
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-                }
-            )
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                'Referer': 'https://www.napiprojekt.pl/'
+            }
+            
+            req = urllib.request.Request(detail_url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as response:
                 detail_page = response.read().decode('utf-8')
-                
+            
             soup = BeautifulSoup(detail_page, 'lxml')
-            for row in soup.select('tbody > tr'):
-                link = row.find('a', href=re.compile(r'napiprojekt:'))
-                if link:
-                    cols = row.find_all('td')
-                    if len(cols) > 4:
-                        sub_data = {
-                            'language': 'pol',
-                            'label': f"{cols[1].get_text(strip=True)} | {cols[3].get_text(strip=True)} | {cols[4].get_text(strip=True)}",
-                            'link_hash': link['href'].replace('napiprojekt:', ''),
-                            'duration_text': cols[3].get_text(strip=True),
-                            'fps': cols[4].get_text(strip=True),
-                            'downloads': cols[5].get_text(strip=True) if len(cols) > 5 else 'N/A'
-                        }
-                        subs.append(sub_data)
-                        self.log(f"Found subtitle: {sub_data}")
+            
+            # Nowa metoda znajdowania tabeli z napisami
+            subtitles_table = soup.find('table', {'class': 'movieSubtitles'})
+            if not subtitles_table:
+                subtitles_table = soup.find('table', {'id': 'subtitlesList'})
+            
+            if subtitles_table:
+                for row in subtitles_table.find_all('tr'):
+                    try:
+                        link = row.find('a', href=lambda x: x and 'napiprojekt:' in x)
+                        if not link:
+                            continue
+                            
+                        cols = row.find_all('td')
+                        if len(cols) < 5:
+                            continue
+                        
+                        # Pobieranie danych napisów
+                        lang = 'pol'
+                        author = cols[1].get_text(strip=True)
+                        fps = cols[3].get_text(strip=True)
+                        downloads = cols[4].get_text(strip=True) if len(cols) > 4 else 'N/A'
+                        
+                        # Dodatkowe informacje z linku
+                        link_hash = link['href'].split(':')[1]
+                        
+                        subs.append({
+                            'language': lang,
+                            'label': f"{author} | {fps} | {downloads}",
+                            'link_hash': link_hash,
+                            'fps': fps,
+                            'downloads': downloads
+                        })
+                        
+                        self.log(f"Found subtitle: {link_hash} ({fps}, {downloads})")
+                    except Exception as e:
+                        self.log(f"Error processing subtitle row: {str(e)}")
+                        continue
+            else:
+                self.log(f"No subtitles table found on page: {detail_url}")
 
         except Exception as e:
-            self.log(f"Detail page error: {detail_url}", e)
+            self.log(f"Detail page error: {str(e)}", e)
+        
         return subs
