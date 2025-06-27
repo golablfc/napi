@@ -22,12 +22,14 @@ class NapiProjektKatalog:
         self.logger.info("NapiProjektKatalog initialized")
 
     def log(self, message, ex=None):
+        """Uniwersalna metoda logowania"""
         if ex:
             self.logger.error(f"{message}\n{traceback.format_exc()}")
         else:
             self.logger.info(message)
 
     def _decrypt(self, data):
+        """Deszyfrowanie danych NP"""
         key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
         decrypted = bytearray(data)
         for i in range(len(decrypted)):
@@ -36,6 +38,7 @@ class NapiProjektKatalog:
         return bytes(decrypted)
 
     def _convert_microdvd_to_srt(self, content):
+        """Konwersja formatu MicroDVD do SRT"""
         try:
             if not content:
                 return None
@@ -73,6 +76,7 @@ class NapiProjektKatalog:
             return None
 
     def _format_time(self, seconds):
+        """Formatowanie czasu do formatu SRT"""
         hours = int(seconds / 3600)
         minutes = int((seconds % 3600) / 60)
         seconds_val = int(seconds % 60)
@@ -80,6 +84,7 @@ class NapiProjektKatalog:
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
     def _handle_old_format(self, data):
+        """Obsługa starych formatów napisów"""
         try:
             try:
                 text = data.decode('utf-8-sig')
@@ -126,6 +131,7 @@ class NapiProjektKatalog:
         return None
 
     def download(self, md5hash):
+        """Pobieranie napisów"""
         for attempt in range(3):
             try:
                 params = {
@@ -181,6 +187,7 @@ class NapiProjektKatalog:
         return None
 
     def search(self, item, imdb_id):
+        """Wyszukiwanie napisów w katalogu"""
         subtitle_list = []
         try:
             title_to_find = item.get('tvshow') or item.get('title') or imdb_id
@@ -201,8 +208,7 @@ class NapiProjektKatalog:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Referer': 'https://www.napiprojekt.pl/'
+                'X-Requested-With': 'XMLHttpRequest'
             }
             
             req = urllib.request.Request(
@@ -246,76 +252,57 @@ class NapiProjektKatalog:
             return []
 
     def _build_detail_url(self, item, href):
+        """Budowanie URL do szczegółów napisów"""
         match = re.search(r'napisy-(\d+)-(.*)', href)
         if match:
             napi_id, slug = match.groups()
-            title = item.get('tvshow') or item.get('title') or ''
-            year = f"-({item['year']})" if item.get('year') else ''
             
+            # Usuwamy istniejący rok z slug jeśli jest
+            slug = re.sub(r'-\d{4}\)?$', '', slug)
+            
+            # Dla seriali
             if item.get('tvshow') and item.get('season') and item.get('episode'):
                 season = str(item['season']).zfill(2)
                 episode = str(item['episode']).zfill(2)
                 return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-s{season}e{episode}"
+            # Dla filmów
+            elif item.get('year'):
+                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}-({item['year']})"
+            # Dla przypadków bez roku
             else:
-                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}{year}"
+                return f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}"
         return urllib.parse.urljoin(self.base_url, href)
 
     def _get_subtitles_from_detail(self, detail_url):
         """Pobieranie listy napisów ze strony szczegółów"""
         subs = []
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                'Referer': 'https://www.napiprojekt.pl/'
-            }
-            
-            req = urllib.request.Request(detail_url, headers=headers)
+            req = urllib.request.Request(
+                detail_url, 
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+                }
+            )
             with urllib.request.urlopen(req, timeout=15) as response:
                 detail_page = response.read().decode('utf-8')
-            
+                
             soup = BeautifulSoup(detail_page, 'lxml')
-            
-            # Nowa metoda znajdowania tabeli z napisami
-            subtitles_table = soup.find('table', {'class': 'movieSubtitles'})
-            if not subtitles_table:
-                subtitles_table = soup.find('table', {'id': 'subtitlesList'})
-            
-            if subtitles_table:
-                for row in subtitles_table.find_all('tr'):
-                    try:
-                        link = row.find('a', href=lambda x: x and 'napiprojekt:' in x)
-                        if not link:
-                            continue
-                            
-                        cols = row.find_all('td')
-                        if len(cols) < 5:
-                            continue
-                        
-                        # Pobieranie danych napisów
-                        lang = 'pol'
-                        author = cols[1].get_text(strip=True)
-                        fps = cols[3].get_text(strip=True)
-                        downloads = cols[4].get_text(strip=True) if len(cols) > 4 else 'N/A'
-                        
-                        # Dodatkowe informacje z linku
-                        link_hash = link['href'].split(':')[1]
-                        
-                        subs.append({
-                            'language': lang,
-                            'label': f"{author} | {fps} | {downloads}",
-                            'link_hash': link_hash,
-                            'fps': fps,
-                            'downloads': downloads
-                        })
-                        
-                        self.log(f"Found subtitle: {link_hash} ({fps}, {downloads})")
-                    except Exception as e:
-                        self.log(f"Error processing subtitle row: {str(e)}")
-                        continue
-            else:
-                self.log(f"No subtitles table found on page: {detail_url}")
+            for row in soup.select('tbody > tr'):
+                link = row.find('a', href=re.compile(r'napiprojekt:'))
+                if link:
+                    cols = row.find_all('td')
+                    if len(cols) > 4:
+                        sub_data = {
+                            'language': 'pol',
+                            'label': f"{cols[1].get_text(strip=True)} | {cols[3].get_text(strip=True)} | {cols[4].get_text(strip=True)}",
+                            'link_hash': link['href'].replace('napiprojekt:', ''),
+                            'duration_text': cols[3].get_text(strip=True),
+                            'fps': cols[4].get_text(strip=True),
+                            'downloads': cols[5].get_text(strip=True) if len(cols) > 5 else 'N/A'
+                        }
+                        subs.append(sub_data)
+                        self.log(f"Found subtitle: {sub_data}")
 
         except Exception as e:
-            self.log(f"Detail page error: {str(e)}", e)
-        
+            self.log(f"Detail page error: {detail_url}", e)
         return subs
