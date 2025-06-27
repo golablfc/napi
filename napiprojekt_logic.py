@@ -10,10 +10,9 @@ import zlib
 import struct
 import time
 import binascii
-
+from typing import List, Dict, Optional
 
 class NapiProjektKatalog:
-
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.download_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
@@ -80,24 +79,30 @@ class NapiProjektKatalog:
         return f"{hours:02d}:{minutes:02d}:{seconds_val:02d},{milliseconds:03d}"
 
     def _parse_duration(self, duration_text):
-        """Konwertuje tekst czasu (HH:MM:SS lub MM:SS) na sekundy"""
         try:
             parts = list(map(float, duration_text.split(':')))
-            if len(parts) == 3:  # HH:MM:SS
+            if len(parts) == 3:
                 return parts[0] * 3600 + parts[1] * 60 + parts[2]
-            elif len(parts) == 2:  # MM:SS
+            elif len(parts) == 2:
                 return parts[0] * 60 + parts[1]
             return None
         except:
             return None
 
-    def _calculate_match_score(self, video_duration, sub_duration):
-        """Oblicza procentowe dopasowanie czasowe (0-100)"""
+    def _calculate_match_score(self, video_duration, sub_duration, video_fps=None, sub_fps=None):
+        """Nowa metoda scoringowa - im mniejszy wynik, tym lepsze dopasowanie"""
         if not video_duration or not sub_duration:
-            return 50  # Wartość domyślna gdy brak danych
+            return float('inf')
+            
+        duration_diff = abs(video_duration - sub_duration)
+        fps_diff = abs((video_fps or 0) - (sub_fps or 0)) if video_fps and sub_fps else 0
         
-        time_diff = abs(video_duration - sub_duration)
-        return max(0, 100 - (time_diff / 60))  # -1% za każdą minutę różnicy
+        score = (duration_diff * 0.8) + (fps_diff * 0.2)
+        return score
+
+    def _extract_fps_from_label(self, label):
+        match = re.search(r'(\d+\.\d+|\d+)\s*FPS', label)
+        return float(match.group(1)) if match else None
 
     def _handle_old_format(self, data):
         try:
@@ -200,7 +205,7 @@ class NapiProjektKatalog:
         
         return None
 
-    def search(self, item, imdb_id, video_duration=None):
+    def search(self, item, imdb_id, video_duration=None, video_fps=None):
         subtitle_list = []
         try:
             title_to_find = item.get('tvshow') or item.get('title') or imdb_id
@@ -251,16 +256,23 @@ class NapiProjektKatalog:
                                 continue
                             
                             self.log(f"Found detail page: {detail_url}")
-                            subs = self._get_subtitles_from_detail(detail_url, video_duration)
+                            subs = self._get_subtitles_from_detail(detail_url, video_duration, video_fps)
                             subtitle_list.extend(subs)
                 except Exception as e:
                     self.log("Error processing block", e)
                     continue
             
-            # Sortuj wszystkie znalezione napisy
-            subtitle_list.sort(key=lambda x: x['score'], reverse=True)
-            self.log(f"Found {len(subtitle_list)} subtitles (best score: {subtitle_list[0]['score'] if subtitle_list else 'N/A'})")
-            return subtitle_list
+            subtitle_list.sort(key=lambda x: x['score'])
+            
+            for i, sub in enumerate(subtitle_list[:15]):
+                self.log(
+                    f"Subtitle #{i+1}: {sub['label']} | "
+                    f"Score: {sub['score']:.2f} | "
+                    f"Duration: {sub['_duration']}s | "
+                    f"FPS: {sub.get('_fps', 'N/A')}"
+                )
+            
+            return subtitle_list[:15]
             
         except Exception as e:
             self.log("Search error", e)
@@ -271,27 +283,22 @@ class NapiProjektKatalog:
         if match:
             napi_id, slug = match.groups()
             
-            # Usuwamy istniejący rok z slug jeśli jest
             slug = re.sub(r'[-\s]*\(?\d{4}\)?$', '', slug).strip('-')
             
-            # Budujemy podstawowy URL
             base_url = f"{self.base_url}/napisy1,1,1-dla-{napi_id}-{slug}"
             
-            # Dla seriali dodajemy sezon i odcinek
             if item.get('tvshow') and item.get('season') and item.get('episode'):
                 season = str(item['season']).zfill(2)
                 episode = str(item['episode']).zfill(2)
                 return f"{base_url}-s{season}e{episode}"
-            # Dla filmów dodajemy rok tylko jeśli jest dostępny
             elif item.get('year'):
                 return f"{base_url}-({item['year']})"
-            # Dla przypadków bez roku
             else:
                 return base_url
                 
         return urllib.parse.urljoin(self.base_url, href)
 
-    def _get_subtitles_from_detail(self, detail_url, video_duration=None):
+    def _get_subtitles_from_detail(self, detail_url, video_duration=None, video_fps=None):
         subs = []
         try:
             req = urllib.request.Request(
@@ -314,14 +321,22 @@ class NapiProjektKatalog:
 
                 duration_text = cols[3].get_text(strip=True)
                 sub_duration = self._parse_duration(duration_text)
-                score = self._calculate_match_score(video_duration, sub_duration)
+                sub_fps = self._extract_fps_from_label(cols[2].get_text(strip=True))
+                
+                score = self._calculate_match_score(
+                    video_duration,
+                    sub_duration,
+                    video_fps,
+                    sub_fps
+                )
 
                 subs.append({
                     'language': 'pol',
                     'label': f"{cols[1].get_text(strip=True)} | {duration_text}",
                     'link_hash': link['href'].replace('napiprojekt:', ''),
                     'score': score,
-                    '_duration': sub_duration
+                    '_duration': sub_duration,
+                    '_fps': sub_fps
                 })
 
         except Exception as e:
