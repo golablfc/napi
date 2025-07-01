@@ -280,8 +280,10 @@ class NapiProjektKatalog:
             if not hdr:
                 return False
             have = self._tokenize(hdr.get_text(" ", strip=True))
-            if not need_tokens.issubset(have):
-                return False
+            joined = " ".join(have)
+            for token in need_tokens:
+                if token not in joined:
+                    return False
         if season and episode and not self._is_episode_match(blk, season, episode):
             return False
         return True
