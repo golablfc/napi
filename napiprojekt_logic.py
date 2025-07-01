@@ -1,59 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import urllib.request
-import urllib.parse
-import re
-import base64
-import logging
-import zlib
-import struct
-import time
-import unicodedata
+import urllib.request, urllib.parse, re, base64, logging, zlib, struct, time, unicodedata, json
 from xml.dom import minidom
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 
-MAX_PAGES = 4          # maksymalnie 4 podstrony detail
-PAGE_DELAY = 0.1       # 0.1 s pauzy między podstronami
-STOPWORDS = {"the", "a", "an", "of", "and"}
+MAX_PAGES  = 4      # maks. liczba podstron w detalu
+PAGE_DELAY = 0.1    # pauza między podstronami
+STOPWORDS  = {"the", "a", "an", "of", "and"}
 
-# ───────────────────────── klas a główna ──────────────────────────────
 class NapiProjektKatalog:
     def __init__(self):
         self.logger = logging.getLogger("NapiProjekt")
         self.logger.setLevel(logging.DEBUG)
         if not self.logger.handlers:
             h = logging.StreamHandler()
+            h.setLevel(logging.DEBUG)
             h.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(h)
 
         self.download_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
-        self.search_url = "https://www.napiprojekt.pl/ajax/search_catalog.php"
-        self.base_url = "https://www.napiprojekt.pl"
+        self.search_url   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
+        self.base_url     = "https://www.napiprojekt.pl"
         self.logger.info("NapiProjektKatalog initialized")
 
-    # ───────────────────────── normalizacja / tokeny ───────────────────
+    # ───────────────────────── normalizacja i tokeny ─────────────────────────
     @staticmethod
     def _norm(txt: str) -> str:
         return unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("ascii").lower()
 
     @staticmethod
     def _tokenize(txt: str) -> set:
-        toks = re.findall(r"[a-z0-9]+", NapiProjektKatalog._norm(txt))
-        return {t for t in toks if len(t) >= 4 and t not in STOPWORDS}
+        """Tokeny ≥4 znaki, a jeśli nic nie zostaje – ≥2 znaki (bez stop‑words)."""
+        base = re.findall(r"[a-z0-9]+", NapiProjektKatalog._norm(txt))
+        tok4 = {t for t in base if len(t) >= 4 and t not in STOPWORDS}
+        return tok4 if tok4 else {t for t in base if len(t) >= 2 and t not in STOPWORDS}
 
-    # ───────────────────────── decrypt helper ──────────────────────────
+    # ───────────────────────── decrypt helper ────────────────────────────────
     @staticmethod
-    def _decrypt(data: bytes) -> bytes:
+    def _decrypt(b: bytes) -> bytes:
         key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
-        dec = bytearray(data)
-        for i in range(len(dec)):
-            dec[i] ^= key[i % 8]
-            dec[i] = ((dec[i] << 4) & 0xFF) | (dec[i] >> 4)
-        return bytes(dec)
+        d = bytearray(b)
+        for i in range(len(d)):
+            d[i] ^= key[i % 8]
+            d[i] = ((d[i] << 4) & 0xFF) | (d[i] >> 4)
+        return bytes(d)
 
-    # ───────────────────────── format czasu → SRT ─────────────────────
+    # ───────────────────────── format czasu → SRT ───────────────────────────
     @staticmethod
     def _format_time(sec: float) -> str:
         h = int(sec // 3600)
@@ -62,10 +56,10 @@ class NapiProjektKatalog:
         ms = int(round((sec - int(sec)) * 1000))
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    # ───────────────────────── proste HH:MM:SS: → SRT ────────────────
+    # ───────────────────────── HH:MM:SS: linia → SRT ─────────────────────────
     def _convert_simple_time_to_srt(self, txt: str) -> Optional[str]:
         pat = re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*:\s*(.*)$")
-        rows = []
+        items = []
         for ln in txt.splitlines():
             m = pat.match(ln)
             if not m:
@@ -73,19 +67,20 @@ class NapiProjektKatalog:
             h, mi, se, body = m.groups()
             start = int(h) * 3600 + int(mi) * 60 + int(se)
             text = "\n".join(seg.lstrip('/').strip() for seg in body.split('|') if seg.strip())
-            rows.append((start, text))
-        if len(rows) < 2:
+            items.append((start, text))
+        if len(items) < 2:
             return None
         out = []
-        for idx, (st, tx) in enumerate(rows):
+        for idx, (st, tx) in enumerate(items):
             if not tx:
                 continue
-            end = (rows[idx + 1][0] - 0.01) if idx + 1 < len(rows) else st + 3
+            end = (items[idx + 1][0] - 0.01) if idx + 1 < len(items) else st + 3
             out.append(f"{idx + 1}\n{self._format_time(st)} --> {self._format_time(end)}\n{tx}\n")
         return "".join(out)
 
-    # ───────────────────────── MicroDVD/MPL2 → SRT ────────────────────
-    def _convert_microdvd_to_srt(self, txt: str, fps_default: float = 23.976) -> Optional[str]:
+    # ───────────────────────── MicroDVD/MPL2 → SRT ──────────────────────────
+    def _convert_microdvd_to_srt(self, txt: str,
+                                 fps_default: float = 23.976) -> Optional[str]:
         if not txt or "-->" in txt:
             return txt
         if "{" not in txt and "[" not in txt:
@@ -100,7 +95,7 @@ class NapiProjektKatalog:
                 continue
             br, a_raw, _, b_raw, body = m.groups()
             a, b = int(a_raw), int(b_raw)
-            if a == 0 and b == 0:   # FPS info
+            if a == 0 and b == 0:
                 mf = re.search(r"(\d+(?:\.\d+)?)", body)
                 if mf:
                     try:
@@ -112,20 +107,13 @@ class NapiProjektKatalog:
         if not items:
             return None
 
-        first_br = items[0][0]
-        if first_br == "{":
-            mode = "frames"
-            fps = fps_hdr or fps_default
+        first = items[0][0]
+        if first == "{":
+            mode, fps = "frames", fps_hdr or fps_default
         else:
-            if fps_hdr:
-                mode = "frames"
-                fps = fps_hdr
-            else:
-                mode = "mpl2"
-                fps = None
+            mode, fps = ("frames", fps_hdr) if fps_hdr else ("mpl2", None)
 
-        out = []
-        idx = 1
+        out, idx = [], 1
         for _, a, b, body in items:
             text = "\n".join(seg.lstrip('/').strip() for seg in body.split('|') if seg.strip())
             if not text:
@@ -140,7 +128,7 @@ class NapiProjektKatalog:
             idx += 1
         return "".join(out) if out else None
 
-    # ───────────────────────── parse duration, FPS ────────────────────
+    # ───────────────────────── parse helpers ───────────────────────────────
     @staticmethod
     def _parse_duration(txt: str) -> Optional[float]:
         if not txt:
@@ -169,7 +157,7 @@ class NapiProjektKatalog:
         m = re.search(r"(\d+(?:\.\d+)?)\s*FPS", lbl, re.I)
         return float(m.group(1)) if m else None
 
-    # ───────────────────────── DOWNLOAD napisów ───────────────────────
+    # ───────────────────────── DOWNLOAD napisów ────────────────────────────
     def download(self, md5hash: str) -> Optional[str]:
         try:
             data = urllib.parse.urlencode({
@@ -179,7 +167,8 @@ class NapiProjektKatalog:
                 "downloaded_subtitles_lang": "PL",
                 "downloaded_subtitles_txt": "1"
             }).encode("utf-8")
-            req = urllib.request.Request(self.download_url, data=data, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(self.download_url, data=data,
+                                         headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status != 200:
                     return None
@@ -205,7 +194,7 @@ class NapiProjektKatalog:
             self.logger.error(f"Download err {md5hash}: {e}")
             return None
 
-    # ───────────────────────── dopasowanie epizodu ────────────────────
+    # ───────────────────────── epizody ──────────────────────────
     def _is_episode_match(self, blk, season: str, episode: str) -> bool:
         if not season or not episode:
             return False
@@ -213,7 +202,7 @@ class NapiProjektKatalog:
         txt = self._norm(blk.get_text(" ", strip=True))
         return bool(re.search(fr"s{s}e{e}|{s}x{e}", txt, re.I))
 
-    # ───────────────────────── budowanie URL detalu ──────────────────
+    # ───────────────────────── build detail URL ─────────────────
     def _build_detail_url(self, item: Dict[str, str], href: str) -> str:
         m = re.search(r"napisy-(\d+)-(.*)", href)
         if not m:
@@ -231,7 +220,7 @@ class NapiProjektKatalog:
             base = f"{base}-({item['year']})"
         return base
 
-    # ───────────────────────── pobranie detail -> lista napisów ───────
+    # ───────────────────────── detail → list of subs ────────────
     def _get_subtitles_from_detail(self, url: str) -> List[dict]:
         subs, seen = [], set()
         pattern = re.compile(r"napisy\d+,")
@@ -273,17 +262,18 @@ class NapiProjektKatalog:
             time.sleep(PAGE_DELAY)
         return subs
 
-    # ───────────────────────── AJAX search helper ────────────────────
+    # ───────────────────────── AJAX search helper ───────────────
     def _fetch_search_html(self, data: bytes) -> str:
         try:
-            req = urllib.request.Request(self.search_url, data=data, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(self.search_url, data=data,
+                                         headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return resp.read().decode("utf-8", "ignore")
         except Exception as e:
             self.logger.debug(f"search_catalog request error: {e}")
             return ""
 
-    # ───────────────────────── filtr bloków ───────────────────────────
+    # ───────────────────────── blok OK? ─────────────────────────
     def _block_ok(self, blk, need_tokens: set, season: str, episode: str) -> bool:
         if need_tokens:
             hdr = blk.find("a", class_="movieTitleCat")
@@ -296,21 +286,21 @@ class NapiProjektKatalog:
             return False
         return True
 
-    # ───────────────────────── główne SEARCH ─────────────────────────
+    # ───────────────────────── MAIN SEARCH ─────────────────────
     def search(self, item: Dict[str, str], imdb_id: str, *_):
         try:
             q = (item.get("tvshow") or item.get("title") or imdb_id).lower()
 
             htmls = [
                 self._fetch_search_html(urllib.parse.urlencode({
-                    "queryKind": "1", "queryString": q, "queryYear": item.get("year", ""), "associate": imdb_id
-                }).encode()),
+                    "queryKind": "1", "queryString": q,
+                    "queryYear": item.get("year", ""), "associate": imdb_id}).encode()),
                 self._fetch_search_html(urllib.parse.urlencode({
-                    "queryKind": "1", "queryString": q, "queryYear": item.get("year", ""), "associate": ""
-                }).encode()),
+                    "queryKind": "1", "queryString": q,
+                    "queryYear": item.get("year", ""), "associate": ""}).encode()),
                 self._fetch_search_html(urllib.parse.urlencode({
-                    "queryKind": "2", "queryString": q, "queryYear": item.get("year", "")
-                }).encode())
+                    "queryKind": "2", "queryString": q,
+                    "queryYear": item.get("year", "")}).encode())
             ]
 
             blocks = []
@@ -323,12 +313,11 @@ class NapiProjektKatalog:
                 return []
 
             need_tokens = self._tokenize(item.get("title") or item.get("tvshow") or "")
-            season = item.get("season"); episode = item.get("episode")
+            season, episode = item.get("season"), item.get("episode")
 
             filtered = [b for b in blocks if self._block_ok(b, need_tokens, season, episode)]
-
             if not filtered:
-                self.logger.debug("No blocks matched title/episode tokens – returning empty list")
+                self.logger.debug("No blocks matched title/episode tokens – 0 results")
                 return []
 
             out = []
@@ -338,10 +327,11 @@ class NapiProjektKatalog:
                 subs = self._get_subtitles_from_detail(detail)
                 if not subs and season:
                     subs = self._get_subtitles_from_detail(re.sub(
-                        r"-s\d{2}e\d{2}$", f"-s{season.zfill(2)}", detail, flags=re.I))
+                        r"-s\d{2}e\d{2}$",
+                        f"-s{season.zfill(2)}", detail, flags=re.I))
                 if not subs:
-                    subs = self._get_subtitles_from_detail(
-                        re.sub(r"-s\d{2}(e\d{2})?$", "", detail, flags=re.I))
+                    subs = self._get_subtitles_from_detail(re.sub(
+                        r"-s\d{2}(e\d{2})?$", "", detail, flags=re.I))
                 out.extend(subs)
 
             out.sort(key=lambda s: s.get('_downloads', 0), reverse=True)
