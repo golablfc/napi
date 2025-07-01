@@ -10,11 +10,11 @@ MAX_PAGES  = 4
 PAGE_DELAY = 0.1
 STOPWORDS  = {"the", "a", "an", "of", "and"}
 
-# ───────────────────────── klasa główna ────────────────────────────────
+# ───────────────────────── klasa główna ───────────────────────────────
 class NapiProjektKatalog:
     def __init__(self):
         self.logger = logging.getLogger("NapiProjekt")
-        self.logger.setLevel(logging.DEBUG)                 # DEBUG → pełne logi
+        self.logger.setLevel(logging.DEBUG)
         if not self.logger.handlers:
             h = logging.StreamHandler()
             h.setLevel(logging.DEBUG)
@@ -33,6 +33,7 @@ class NapiProjektKatalog:
 
     @staticmethod
     def _tokenize(txt: str) -> set:
+        """tokeny ≥4 znaki (fallback ≥2 gdyby opróżniło) – dla TYTUŁU SZUKANEGO"""
         words = re.findall(r"[a-z0-9]+", NapiProjektKatalog._norm(txt))
         tok4  = {w for w in words if len(w) >= 4 and w not in STOPWORDS}
         return tok4 if tok4 else {w for w in words if len(w) >= 2 and w not in STOPWORDS}
@@ -40,11 +41,11 @@ class NapiProjektKatalog:
     # ───────────────────────── decrypt helper ───────────────────────────
     @staticmethod
     def _decrypt(b: bytes) -> bytes:
-        key = [0x5E,0x34,0x45,0x43,0x52,0x45,0x54,0x5F]
-        d = bytearray(b)
+        key=[0x5E,0x34,0x45,0x43,0x52,0x45,0x54,0x5F]
+        d=bytearray(b)
         for i in range(len(d)):
-            d[i] ^= key[i % 8]
-            d[i] = ((d[i] << 4) & 0xFF) | (d[i] >> 4)
+            d[i]^=key[i%8]
+            d[i]=((d[i]<<4)&0xFF)|(d[i]>>4)
         return bytes(d)
 
     # ───────────────────────── format czasu ─────────────────────────────
@@ -56,7 +57,7 @@ class NapiProjektKatalog:
 
     # ───────────────────────── HH:MM:SS: → SRT ──────────────────────────
     def _convert_simple_time_to_srt(self, txt: str) -> Optional[str]:
-        pat = re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*:\s*(.*)$")
+        pat=re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*:\s*(.*)$")
         items=[]
         for ln in txt.splitlines():
             m=pat.match(ln)
@@ -111,7 +112,7 @@ class NapiProjektKatalog:
             out.append(f"{idx}\n{t1} --> {t2}\n{text}\n"); idx+=1
         return "".join(out) if out else None
 
-    # ───────────────────────── parse helpery ─────────────────────────────
+    # ───────────────────────── parse helpers ────────────────────────────
     @staticmethod
     def _parse_duration(txt: str) -> Optional[float]:
         if not txt: return None
@@ -174,11 +175,13 @@ class NapiProjektKatalog:
     # ───────────────────────── build detail URL ─────────────────
     def _build_detail_url(self, item: Dict[str,str], href: str) -> str:
         m=re.search(r"napisy-(\d+)-(.*)",href)
-        if not m: return urllib.parse.urljoin(self.base_url,href)
+        if not m:
+            return urllib.parse.urljoin(self.base_url,href)
         nid,slug=m.groups()
         base=f"{self.base_url}/napisy1,1,1-dla-{nid}-{slug}"
         if item.get("tvshow") and item.get("season") and item.get("episode"):
-            s=item["season"].zfill(2); e=item["episode"].zfill(2)
+            s=item["season"].zfill(2)
+            e=item["episode"].zfill(2)
             if item.get("year") and not re.search(r"\(\d{4}\)",base):
                 base=f"{base}-({item['year']})"
             if not re.search(rf"-s{s}e{e}$",base,re.I):
@@ -187,18 +190,18 @@ class NapiProjektKatalog:
             base=f"{base}-({item['year']})"
         return base
 
-    # ───────────────────────── detail → list of subs ────────────
+    # ───────────────────────── detail → list of subs ────────────
     def _get_subtitles_from_detail(self, url: str) -> List[dict]:
         subs,seen=[],set()
         pattern=re.compile(r"napisy\d+,")
-        for page in range(1,MAX_PAGES+1):
-            pg=pattern.sub(f"napisy{page},",url,1)
+        for pgnum in range(1,MAX_PAGES+1):
+            pgurl=pattern.sub(f"napisy{pgnum},",url,1)
             try:
-                req=urllib.request.Request(pg,headers={'User-Agent':'Mozilla/5.0'})
+                req=urllib.request.Request(pgurl,headers={'User-Agent':'Mozilla/5.0'})
                 with urllib.request.urlopen(req,timeout=15) as resp:
                     html=resp.read()
             except Exception as e:
-                self.logger.debug(f"detail page error {pg}: {e}")
+                self.logger.debug(f"detail page error {pgurl}: {e}")
                 break
             rows=BeautifulSoup(html,'lxml').select("tbody > tr")
             if not rows: break
@@ -224,7 +227,7 @@ class NapiProjektKatalog:
             time.sleep(PAGE_DELAY)
         return subs
 
-    # ───────────────────────── fetch AJAX helper ───────────────────────
+    # ───────────────────────── AJAX search helper ───────────────
     def _fetch_search_html(self, data: bytes) -> str:
         try:
             req=urllib.request.Request(self.search_url,data=data,
@@ -238,25 +241,20 @@ class NapiProjektKatalog:
     # ───────────────────────── blok OK? ─────────────────────────
     def _block_ok(self, blk, need_tokens: set, season: str, episode: str) -> bool:
         hdr = blk.find("a", class_="movieTitleCat")
-        title_text = hdr.get_text(" ", strip=True) if hdr else "<brak>"
-        have = self._tokenize(title_text)
-
-        # log tokeny + tytuł
-        self.logger.debug(f"  ├─ BLK «{title_text}» tokens={have}")
-
+        if not hdr:
+            return False
+        header_norm = self._norm(hdr.get_text(" ", strip=True))
+        self.logger.debug(f"  ├─ BLK «{hdr.get_text(strip=True)}»")
         # tokeny
-        joined = " ".join(have)
         for tok in need_tokens:
-            if tok not in joined:
+            if tok not in header_norm:
                 self.logger.debug(f"  │  ✗ brak tokenu «{tok}»")
                 return False
-
         # sezon/odcinek
-        if season and episode and not self._is_episode_match(blk,season,episode):
+        if season and episode and not self._is_episode_match(blk, season, episode):
             self.logger.debug(f"  │  ✗ sezon/ep nie pasuje")
             return False
-
-        self.logger.debug(f"  │  ✓ blok przyjęty")
+        self.logger.debug("  │  ✓ blok przyjęty")
         return True
 
     # ───────────────────────── MAIN SEARCH ─────────────────────
