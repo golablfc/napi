@@ -1,292 +1,205 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Logika wyszukiwania napisów na NapiProjekt z danymi z TMDB.
+Pobiera tytuł i rok z TMDB (PL), szuka w katalogu NapiProjekt bloku
+z tym tytułem i rokiem, wyciąga ID, buduje URL detail i parsuje napisy.
+"""
 
-import urllib.request, urllib.parse, re, base64, logging, zlib, struct, time, unicodedata
-from xml.dom import minidom
+import logging
+import re
+import time
+import base64
+import zlib
+import struct
+import requests
+from typing import List, Dict
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional
+from utils import (
+    parse_subtitles,
+    convert_microdvd,
+    convert_mpl2,
+    convert_timecoded,
+)
 
-MAX_PAGES  = 4
-PAGE_DELAY = 0.1
+TMDB_API_KEY = "d5d16ca655dd74bd22bbe412502a3815"
+MAX_PAGES = 50           # ile stron katalogu skanować
+PAGE_DELAY = 0.15        # pauza, by nie spamować serwera
+SESSION = requests.Session()
+
 
 class NapiProjektKatalog:
     def __init__(self):
+        self.session = SESSION
         self.logger = logging.getLogger("NapiProjekt")
         self.logger.setLevel(logging.DEBUG)
-        if not self.logger.handlers:
-            h = logging.StreamHandler()
-            h.setLevel(logging.DEBUG)
-            h.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(h)
-        self.download_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
-        self.search_url   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
-        self.base_url     = "https://www.napiprojekt.pl"
-        self.logger.info("NapiProjektKatalog initialized")
 
-    # ─────────────── normalizacja i kanonizacja ─────────────────────────
-    @staticmethod
-    def _norm(txt: str) -> str:
-        return unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("ascii").lower()
+    # ───────────────── TMDB ──────────────────
+    def _fetch_tmdb_info(self, imdb_id):
+        url = (
+            f"https://api.themoviedb.org/3/find/{imdb_id}"
+            f"?api_key={TMDB_API_KEY}&language=pl&external_source=imdb_id"
+        )
+        self.logger.debug(f"TMDB request: {url}")
+        r = self.session.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
 
-    def _canon(self, txt: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", self._norm(txt))
+        for sec in ["tv_results", "movie_results"]:
+            if data.get(sec):
+                obj = data[sec][0]
+                title = (obj.get("name") or obj.get("title") or "").strip()
+                date = obj.get("first_air_date") or obj.get("release_date") or ""
+                year = date[:4] if date else ""
+                self.logger.debug(f"TMDB (pl) -> title={title} year={year}")
+                return title, year
+        return None, None
 
-    def _title_eq(self, hdr: str, wanted: str) -> bool:
-        """czy kanoniczny tytuł TMDB występuje w kanonicznym nagłówku bloku"""
-        return self._canon(wanted) in self._canon(hdr)
-
-    # ─────────────── decrypt helper ─────────────────────────────────────
-    @staticmethod
-    def _decrypt(b: bytes) -> bytes:
-        key=[0x5E,0x34,0x45,0x43,0x52,0x45,0x54,0x5F]
-        d=bytearray(b)
-        for i in range(len(d)):
-            d[i]^=key[i%8]
-            d[i]=((d[i]<<4)&0xFF)|(d[i]>>4)
-        return bytes(d)
-
-    # ─────────────── format czasu → SRT ────────────────────────────────
-    @staticmethod
-    def _format_time(sec: float) -> str:
-        h=int(sec//3600); m=int(sec%3600//60); s=int(sec%60)
-        ms=int(round((sec-int(sec))*1000))
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    # ─────────────── konwertery napisów (bez zmian) ─────────────────────
-    def _convert_simple_time_to_srt(self, txt: str) -> Optional[str]:
-        pat=re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*:\s*(.*)$")
-        items=[]
-        for ln in txt.splitlines():
-            m=pat.match(ln)
-            if not m: continue
-            h,mi,se,body=m.groups()
-            start=int(h)*3600+int(mi)*60+int(se)
-            text="\n".join(seg.lstrip('/').strip() for seg in body.split('|') if seg.strip())
-            items.append((start,text))
-        if len(items)<2: return None
-        out=[]
-        for idx,(st,tx) in enumerate(items):
-            if not tx: continue
-            end=(items[idx+1][0]-0.01) if idx+1<len(items) else st+3
-            out.append(f"{idx+1}\n{self._format_time(st)} --> {self._format_time(end)}\n{tx}\n")
-        return "".join(out)
-
-    def _convert_microdvd_to_srt(self, txt: str, fps_default: float = 23.976) -> Optional[str]:
-        if not txt or "-->" in txt:
-            return txt
-        if "{" not in txt and "[" not in txt:
-            return self._convert_simple_time_to_srt(txt)
-        pat=re.compile(r"([{\[])(\d+)[}\]]([{\[])(\d+)[}\]](.*)")
-        items=[]; fps_hdr=None
-        for ln in txt.splitlines():
-            m=pat.match(ln.strip())
-            if not m: continue
-            br,a_raw,_,b_raw,body=m.groups()
-            a,b=int(a_raw),int(b_raw)
-            if a==0 and b==0:
-                mf=re.search(r"(\d+(?:\.\d+)?)",body)
-                if mf:
-                    try: fps_hdr=float(mf.group(1))
-                    except: pass
-                continue
-            items.append((br,a,b,body))
-        if not items: return None
-        first=items[0][0]
-        if first=="{": mode,fps="frames",fps_hdr or fps_default
-        else: mode,fps=("frames",fps_hdr) if fps_hdr else ("mpl2",None)
-        out=[]; idx=1
-        for _,a,b,body in items:
-            text="\n".join(seg.lstrip('/').strip() for seg in body.split('|') if seg.strip())
-            if not text: continue
-            if mode=="frames":
-                t1=self._format_time(a/fps); t2=self._format_time(b/fps)
-            else:
-                t1=self._format_time(a/10);  t2=self._format_time(b/10)
-            out.append(f"{idx}\n{t1} --> {t2}\n{text}\n"); idx+=1
-        return "".join(out) if out else None
-
-    # ─────────────── parse helpers (bez zmian) ─────────────────────────
-    @staticmethod
-    def _parse_duration(txt: str) -> Optional[float]:
-        if not txt: return None
-        try:
-            if txt.isdigit(): return int(txt)/1000
-            if "." in txt:
-                t,frac=txt.split(".",1); ms=int(frac[:3].ljust(3,"0"))
-            else: t,ms=txt,0
-            parts=list(map(int,t.split(":")))
-            if len(parts)==3: h,m,s=parts
-            elif len(parts)==2: h,m,s=0,*parts
-            else: return None
-            return h*3600+m*60+s+ms/1000
-        except: return None
-
-    @staticmethod
-    def _extract_fps_from_label(lbl: str) -> Optional[float]:
-        m=re.search(r"(\d+(?:\.\d+)?)\s*FPS",lbl,re.I)
-        return float(m.group(1)) if m else None
-
-    # ─────────────── DOWNLOAD (bez zmian) ──────────────────────────────
-    def download(self, md5hash: str) -> Optional[str]:
-        try:
-            data=urllib.parse.urlencode({
-                "mode":"17","client":"NapiProjektPython",
-                "downloaded_subtitles_id":md5hash,
-                "downloaded_subtitles_lang":"PL",
-                "downloaded_subtitles_txt":"1"}).encode("utf-8")
-            req=urllib.request.Request(self.download_url,data=data,
-                                       headers={"User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(req,timeout=15) as resp:
-                xml=minidom.parseString(resp.read())
-            content=xml.getElementsByTagName("content")[0].firstChild.data
-            bin_data=base64.b64decode(content)
-            if bin_data.startswith(b"NP"):
-                dec=self._decrypt(bin_data[4:])
-                crc=struct.unpack("<I",dec[:4])[0]
-                inner=dec[4:]
-                if zlib.crc32(inner)&0xFFFFFFFF!=crc: return None
-                raw=zlib.decompress(inner,-zlib.MAX_WBITS).decode("utf-8","ignore")
-            else:
-                try: raw=bin_data.decode("utf-8")
-                except UnicodeDecodeError: raw=bin_data.decode("cp1250","ignore")
-            if "{" in raw or "[" in raw or re.search(r"^\s*\d{1,2}:\d{2}:\d{2}\s*:",raw,re.M):
-                raw=self._convert_microdvd_to_srt(raw) or raw
-            return raw
-        except Exception as e:
-            self.logger.error(f"Download err {md5hash}: {e}")
-            return None
-
-    # ─────────────── dopasowanie epizodu ───────────────────────────────
-    def _is_episode_match(self, blk, season: str, episode: str) -> bool:
-        if not season: return True            # jeśli brak sezonu – nie filtrujemy
-        s = season.zfill(2)
-        txt = self._norm(blk.get_text(" ", strip=True))
-        # Akceptuj, gdy nagłówek ma SXXEYY **lub** samo SXX (bez odcinka)
-        if re.search(fr"s{s}e{episode.zfill(2)}|\b{s}x{episode.zfill(2)}", txt, re.I):
-            return True
-        if re.search(fr"s{s}\b|\b{s}x", txt, re.I) and not episode:
-            return True
-        return False
-
-    # ─────────────── build detail URL (bez zmian) ──────────────────────
-    def _build_detail_url(self, item: Dict[str, str], href: str) -> str:
-        m=re.search(r"napisy-(\d+)-(.*)",href)
-        if not m:
-            return urllib.parse.urljoin(self.base_url,href)
-        nid,slug=m.groups()
-        base=f"{self.base_url}/napisy1,1,1-dla-{nid}-{slug}"
-        if item.get("tvshow") and item.get("season"):
-            s=item["season"].zfill(2)
-            if item.get("episode"):
-                e=item["episode"].zfill(2)
-                base=f"{base}-s{s}e{e}"
-            else:
-                base=f"{base}-s{s}"
-        if item.get("year") and not re.search(r"\(\d{4}\)",base):
-            base=f"{base}-({item['year']})"
-        return base
-
-    # ─────────────── detail → list of subs (bez zmian) ─────────────────
-    def _get_subtitles_from_detail(self, url: str) -> List[dict]:
-        subs,seen=[],set(); pattern=re.compile(r"napisy\d+,")
-        for pg in range(1,MAX_PAGES+1):
-            pgurl=pattern.sub(f"napisy{pg},",url,1)
-            try:
-                req=urllib.request.Request(pgurl,headers={'User-Agent':'Mozilla/5.0'})
-                with urllib.request.urlopen(req,timeout=15) as resp:
-                    html=resp.read()
-            except: break
-            rows=BeautifulSoup(html,'lxml').select("tbody > tr")
-            if not rows: break
-            for r in rows:
-                a=r.find('a',href=re.compile(r'napiprojekt:'))
-                if not a: continue
-                h=a['href'].replace('napiprojekt:','')
-                if h in seen: continue
-                seen.add(h)
-                cols=r.find_all('td')
-                if len(cols)<5: continue
-                try: dls=int(re.sub(r"[^\d]","",cols[4].get_text(strip=True))) or 0
-                except: dls=0
-                subs.append({
-                    'language':'pol',
-                    'label':cols[1].get_text(strip=True),
-                    'link_hash':h,
-                    '_duration':self._parse_duration(cols[3].get_text(strip=True)),
-                    '_fps':self._extract_fps_from_label(cols[2].get_text(strip=True)),
-                    '_downloads':dls})
-                if len(subs)>=100: return subs
+    # ───────────────── katalog NP ────────────
+    def _fetch_catalog_blocks(self, title: str, year: str):
+        """
+        Iteruje po katalogu (napisy-katalog-<page>-wszystkie-<year>)
+        i zwraca listę krotek (id, pełny_tytuł, href)
+        """
+        canon_title = re.sub(r"[^a-z0-9]", "", title.lower())
+        results = []
+        for page in range(1, MAX_PAGES + 1):
+            url = (
+                f"https://www.napiprojekt.pl/napisy-katalog-"
+                f"{page}-wszystkie-{year}-0-0.html"
+            )
+            self.logger.debug(f"SEARCH katalog: {url}")
+            r = self.session.get(url, timeout=15)
+            if r.status_code != 200:
+                break
+            soup = BeautifulSoup(r.text, "lxml")
+            blocks = soup.select("div.kategoria > div")
+            self.logger.debug(f"SEARCH blocks: {len(blocks)} page={page}")
+            for blk in blocks:
+                a = blk.select_one(".movieTitleCat")
+                if not a:
+                    continue
+                hdr = a.text.strip()
+                canon_hdr = re.sub(r"[^a-z0-9]", "", hdr.lower())
+                if canon_title not in canon_hdr and canon_hdr not in canon_title:
+                    continue
+                href = a["href"]
+                m = re.search(r"-dla-(\d+)-", href)
+                if m:
+                    nid = m.group(1)
+                    results.append((nid, hdr, href))
+            if results:
+                break
             time.sleep(PAGE_DELAY)
-        return subs
+        return results
 
-    # ─────────────── fetch AJAX helper (bez zmian) ─────────────────────
-    def _fetch_search_html(self, data: bytes) -> str:
-        try:
-            req=urllib.request.Request(self.search_url,data=data,
-                                       headers={"User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(req,timeout=15) as resp:
-                return resp.read().decode("utf-8","ignore")
-        except Exception as e:
-            self.logger.debug(f"search_catalog request error: {e}")
-            return ""
+    # ───────────────── decrypt helper ────────
+    @staticmethod
+    def _decrypt_np(payload: bytes) -> str:
+        key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
+        blk = bytearray(payload)
+        for i in range(len(blk)):
+            blk[i] ^= key[i % 8]
+            blk[i] = ((blk[i] << 4) & 0xFF) | (blk[i] >> 4)
+        crc = struct.unpack("<I", blk[:4])[0]
+        data = blk[4:]
+        if zlib.crc32(data) & 0xFFFFFFFF != crc:
+            raise ValueError("CRC mismatch")
+        return zlib.decompress(data, -zlib.MAX_WBITS).decode("utf-8", "ignore")
 
-    # ─────────────── blok OK? ──────────────────────────────────────────
-    def _block_ok(self, blk, title_pl: str, season: str, episode: str) -> bool:
-        hdr = blk.find("a", class_="movieTitleCat")
-        if not hdr: return False
-        hdr_txt = hdr.get_text(" ", strip=True)
-        if not self._title_eq(hdr_txt, title_pl):
-            self.logger.debug(f"  ✗ tytuł nie pasuje: «{hdr_txt}» ≠ «{title_pl}»")
-            return False
-        if not self._is_episode_match(blk, season, episode):
-            self.logger.debug(f"  ✗ sezon/ep odrzucony")
-            return False
-        self.logger.debug(f"  ✓ blok przyjęty «{hdr_txt}»")
-        return True
-
-    # ─────────────── MAIN SEARCH ───────────────────────────────────────
-    def search(self, item: Dict[str, str], imdb_id: str, *_):
-        try:
-            q=(item.get("tvshow") or item.get("title") or imdb_id).lower()
-            htmls=[
-                self._fetch_search_html(urllib.parse.urlencode({
-                    "queryKind":"1","queryString":q,
-                    "queryYear":item.get("year",""),"associate":imdb_id}).encode()),
-                self._fetch_search_html(urllib.parse.urlencode({
-                    "queryKind":"1","queryString":q,
-                    "queryYear":item.get("year",""),"associate":""}).encode()),
-                self._fetch_search_html(urllib.parse.urlencode({
-                    "queryKind":"2","queryString":q,
-                    "queryYear":item.get("year","")}).encode())
-            ]
-            blocks=[]
-            for h in htmls:
-                blocks=BeautifulSoup(h,'lxml').find_all("div",class_="movieSearchContent")
-                self.logger.debug(f"SEARCH blocks: {len(blocks)}")
-                if blocks: break
-            if not blocks:
-                return []
-            title_pl=item.get("title") or item.get("tvshow") or ""
-            season=item.get("season"); episode=item.get("episode")
-            filtered=[b for b in blocks if self._block_ok(b,title_pl,season,episode)]
-            if not filtered:
-                self.logger.debug("No blocks matched title/episode – 0 results")
-                return []
-            out=[]
-            for blk in filtered:
-                detail=self._build_detail_url(item, blk.find("a",class_="movieTitleCat")["href"])
-                self.logger.debug(f"DETAIL try: {detail}")
-                subs=self._get_subtitles_from_detail(detail)
-                if not subs and season:
-                    subs=self._get_subtitles_from_detail(re.sub(
-                        r"-s\d{2}e\d{2}$",
-                        f"-s{season.zfill(2)}", detail, flags=re.I))
-                if not subs:
-                    subs=self._get_subtitles_from_detail(re.sub(
-                        r"-s\d{2}(e\d{2})?$", "", detail, flags=re.I))
-                out.extend(subs)
-            out.sort(key=lambda s:s.get('_downloads',0),reverse=True)
-            return out[:100]
-        except Exception as e:
-            self.logger.error(f"Search error: {e}")
+    # ───────────────── detail page ───────────
+    def _get_subtitles_from_detail(self, url: str):
+        self.logger.debug(f"DETAIL try: {url}")
+        r = self.session.get(url, timeout=15)
+        if r.status_code != 200:
             return []
+        soup = BeautifulSoup(r.text, "lxml")
+        rows = soup.select("tbody tr")
+        return parse_subtitles(rows)
+
+    # ───────────────── download hash ─────────
+    def download(self, napisy_hash: str) -> str | None:
+        url = f"https://www.napiprojekt.pl/api/api-napiprojekt3.php"
+        self.logger.info(f"Pobieranie napisów: {napisy_hash}")
+        data = {
+            "mode": "1",
+            "client": "NapiProjektPython",
+            "downloaded_subtitles_id": napisy_hash,
+            "downloaded_subtitles_lang": "PL",
+            "downloaded_subtitles_txt": "1",
+        }
+        r = self.session.post(url, data=data, timeout=20)
+        if r.status_code != 200:
+            self.logger.error(f"Download HTTP {r.status_code}")
+            return None
+        xml_content = r.text
+        m = re.search(r"<content>(.*?)</content>", xml_content, re.S)
+        if not m:
+            self.logger.error("Download: no <content>")
+            return None
+        payload = base64.b64decode(m.group(1))
+        if payload.startswith(b"NP"):
+            try:
+                raw = self._decrypt_np(payload[4:])
+            except Exception as e:
+                self.logger.error(f"NP decrypt error: {e}")
+                return None
+        else:
+            try:
+                raw = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                raw = payload.decode("cp1250", "ignore")
+
+        if "{" in raw:
+            return convert_microdvd(raw)
+        if "[" in raw:
+            return convert_mpl2(raw)
+        if re.search(r"\d{1,2}:\d{2}:\d{2}\s*:", raw):
+            return convert_timecoded(raw)
+        return raw
+
+    # ───────────────── public search ─────────
+    def search(self, args: Dict) -> List[Dict]:
+        imdb_id = args.get("imdb_id")
+        season = args.get("season")
+        episode = args.get("episode")
+
+        if not imdb_id:
+            self.logger.info("Brak imdb_id – przerywam.")
+            return []
+
+        title, year = self._fetch_tmdb_info(imdb_id)
+        if not title or not year:
+            self.logger.info("TMDB nie zwrócił tytułu/roku.")
+            return []
+
+        self.logger.info(
+            f"Searching NapiProjekt with: "
+            f"{{'imdb_id': '{imdb_id}', 'tvshow': '{title}', 'year': '{year}', "
+            f"'season': '{season}', 'episode': '{episode}'}}"
+        )
+
+        blocks = self._fetch_catalog_blocks(title, year)
+        if not blocks:
+            self.logger.debug("Brak bloków z pasującym tytułem.")
+            return []
+
+        subs = []
+        for nid, hdr, _ in blocks:
+            slug_title = title.replace(" ", "-")
+            base = (
+                f"https://www.napiprojekt.pl/napisy1,1,1-dla-"
+                f"{nid}-{slug_title}-({year})"
+            )
+            detail = (
+                f"{base}-s{season.zfill(2)}e{episode.zfill(2)}"
+                if season and episode
+                else base
+            )
+            subs.extend(self._get_subtitles_from_detail(detail))
+            if len(subs) >= 100:
+                break
+
+        # sortujemy wg liczby pobrań malejąco
+        subs.sort(key=lambda x: x.get("_downloads", 0), reverse=True)
+        return subs[:100]
