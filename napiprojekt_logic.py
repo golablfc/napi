@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NapiProjekt – wyszukiwanie przez ajax/search_catalog.php
-• Uwzględnia zarówno polski, jak i oryginalny tytuł (jak dodatek Kodi homik).
+NapiProjekt · wyszukiwanie napisów przez ajax/search_catalog.php
+Uwzględnia polski i oryginalny tytuł. Maksymalnie 100 wyników.
 """
 
+from __future__ import annotations
 import logging, re, time, base64, zlib, struct, unicodedata, requests
 from typing import Dict, List
 from bs4 import BeautifulSoup
+
 from utils import (
     parse_subtitles,
     convert_microdvd,
@@ -57,13 +59,13 @@ def _decrypt_np(blob: bytes) -> str:
         raise ValueError("CRC mismatch")
     return zlib.decompress(inner, -zlib.MAX_WBITS).decode("utf-8", "ignore")
 
-# ───────── główna klasa ─────────────────────────────────────
+# ───────── klasa główna ─────────────────────────────────────
 class NapiProjektKatalog:
     def __init__(self):
         self.s  = SESSION
         self.log = log
 
-    # TMDb → (t_pl, t_en, rok)
+    # TMDb → (tytuł_PL, tytuł_EN, rok)
     def _tmdb(self, imdb: str):
         url = f"https://api.themoviedb.org/3/find/{imdb}?api_key={TMDB_KEY}&language=pl&external_source=imdb_id"
         self.log.debug(f"TMDB GET: {url}")
@@ -73,16 +75,16 @@ class NapiProjektKatalog:
         js = r.json()
         for sec in ("tv_results", "movie_results"):
             if js.get(sec):
-                o   = js[sec][0]
+                o    = js[sec][0]
                 t_pl = (o.get("name") or o.get("title") or "").strip()
                 t_en = (o.get("original_name") or o.get("original_title") or t_pl).strip()
                 date = o.get("first_air_date") or o.get("release_date") or ""
-                yr   = date[:4] if date else ""
-                self.log.debug(f"TMDB -> pl={t_pl} en={t_en} y={yr}")
-                return t_pl, t_en, yr
+                year = date[:4] if date else ""
+                self.log.debug(f"TMDB -> pl={t_pl} en={t_en} y={year}")
+                return t_pl, t_en, year
         return None, None, None
 
-    # AJAX blocks
+    # AJAX search_catalog.php
     def _ajax_blocks(self, title: str, year: str, is_series: bool):
         data = {
             "queryKind": "1" if is_series else "2",
@@ -100,7 +102,7 @@ class NapiProjektKatalog:
         self.log.debug(f"AJAX blocks: {len(blocks)}")
         return blocks
 
-    # detail → list subtitles
+    # detail page -> subtitles list
     def _detail(self, url: str):
         subs, seen = [], set()
         pat = re.compile(r"napisy\d+,")
@@ -115,12 +117,15 @@ class NapiProjektKatalog:
                 break
             for row in rows:
                 a = row.find("a", href=re.compile(r"napiprojekt:"))
-                if not a: continue
+                if not a:
+                    continue
                 h = a["href"].replace("napiprojekt:", "")
-                if h in seen: continue
+                if h in seen:
+                    continue
                 seen.add(h)
                 tds = row.find_all("td")
-                if len(tds) < 5: continue
+                if len(tds) < 5:
+                    continue
                 try:
                     dls = int(re.sub(r"[^\d]", "", tds[4].text) or "0")
                 except ValueError:
@@ -140,65 +145,79 @@ class NapiProjektKatalog:
         imdb    = meta.get("imdb_id")
         season  = meta.get("season")
         episode = meta.get("episode")
-        if not imdb: return []
+        if not imdb:
+            return []
 
         t_pl, t_en, year = self._tmdb(imdb)
-        if not t_pl: return []
+        if not t_pl:
+            return []
 
         wanted_clean = [get_clean(t_pl)]
         if t_en and t_en.lower() != t_pl.lower():
             wanted_clean.append(get_clean(t_en))
 
         blocks = self._ajax_blocks(t_pl, year, bool(season))
-        if not blocks: return []
+        if not blocks:
+            return []
 
-        cand = []
+        candidates = []
         for blk in blocks:
             h3 = blk.select_one(".movieTitleCat")
-            if not h3: continue
+            if not h3:
+                continue
             hdr = h3.text.strip()
             canon_hdr = get_clean(hdr)
             self.log.debug(f"⮞ {hdr} -> {canon_hdr}")
-            if all(wc not in canon_hdr and canon_hdr not in wc for wc in wanted_clean):
+            if not any(wc in canon_hdr or canon_hdr in wc for wc in wanted_clean):
                 self.log.debug("   ✗ no‑match")
                 continue
+            self.log.debug("   ✓ match")
             m = re.search(r"-dla-(\d+)-", h3["href"])
             if m:
-                self.log.debug("   ✓ match")
-                cand.append(m.group(1))
-        if not cand:
+                candidates.append(m.group(1))
+
+        if not candidates:
             return []
 
         slug = t_pl.replace(" ", "-")
         subs = []
-        for nid in cand:
+        for nid in candidates:
             base = f"{NP_BASE}/napisy1,1,1-dla-{nid}-{slug}-({year})"
             url  = f"{base}-s{season.zfill(2)}e{episode.zfill(2)}" if season and episode else base
             subs.extend(self._detail(url))
-            if len(subs) >= 100: break
+            if len(subs) >= 100:
+                break
 
         subs.sort(key=lambda x: x.get("_downloads", 0), reverse=True)
         return subs[:100]
 
     def download(self, h: str) -> str | None:
-        payload = {
-            "mode":"17",
-            "client":"NapiProjektPython",
-            "downloaded_subtitles_id":h,
-            "downloaded_subtitles_lang":"PL",
-            "downloaded_subtitles_txt":"1",
+        data = {
+            "mode": "17",
+            "client": "NapiProjektPython",
+            "downloaded_subtitles_id": h,
+            "downloaded_subtitles_lang": "PL",
+            "downloaded_subtitles_txt": "1",
         }
-        r = self.s.post(NP_API, data=payload, timeout=20)
-        if r.status_code != 200: return None
+        r = self.s.post(NP_API, data=data, timeout=20)
+        if r.status_code != 200:
+            return None
         m = re.search(r"<content>(.*?)</content>", r.text, re.S)
-        if not m: return None
+        if not m:
+            return None
         blob = base64.b64decode(m.group(1))
         if blob.startswith(b"NP"):
             raw = _decrypt_np(blob[4:])
         else:
-            try: raw = blob.decode("utf-8")
-            except UnicodeDecodeError: raw = blob.decode("cp1250", "ignore")
-        if "{" in raw: return convert_microdvd(raw)
-        if "[" in raw: return convert_mpl2(raw)
-        if re.search(r"\d{1,2}:\d{2}:\d{2}\s*:", raw): return convert_timecoded(raw)
+            try:
+                raw = blob.decode("utf-8")
+            except UnicodeDecodeError:
+                raw = blob.decode("cp1250", "ignore")
+
+        if "{" in raw:
+            return convert_microdvd(raw)
+        if "[" in raw:
+            return convert_mpl2(raw)
+        if re.search(r"\d{1,2}:\d{2}:\d{2}\s*:", raw):
+            return convert_timecoded(raw)
         return raw
