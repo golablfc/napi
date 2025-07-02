@@ -2,19 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Logika wyszukiwania napisów na NapiProjekt z danymi z TMDB.
-Pobiera tytuł i rok z TMDB (PL), szuka w katalogu NapiProjekt bloku
-z tym tytułem i rokiem, wyciąga ID, buduje URL detail i parsuje napisy.
+Dodano obszerne logi DEBUG, aby śledzić każdy odwiedzany URL.
 """
 
-import logging
-import re
-import time
-import base64
-import zlib
-import struct
-import requests
+import logging, re, time, base64, zlib, struct, requests
 from typing import List, Dict
 from bs4 import BeautifulSoup
+
 from utils import (
     parse_subtitles,
     convert_microdvd,
@@ -23,8 +17,8 @@ from utils import (
 )
 
 TMDB_API_KEY = "d5d16ca655dd74bd22bbe412502a3815"
-MAX_PAGES = 50           # ile stron katalogu skanować
-PAGE_DELAY = 0.15        # pauza, by nie spamować serwera
+MAX_PAGES = 50
+PAGE_DELAY = 0.15
 SESSION = requests.Session()
 
 
@@ -45,7 +39,7 @@ class NapiProjektKatalog:
         r.raise_for_status()
         data = r.json()
 
-        for sec in ["tv_results", "movie_results"]:
+        for sec in ("tv_results", "movie_results"):
             if data.get(sec):
                 obj = data[sec][0]
                 title = (obj.get("name") or obj.get("title") or "").strip()
@@ -57,10 +51,6 @@ class NapiProjektKatalog:
 
     # ───────────────── katalog NP ────────────
     def _fetch_catalog_blocks(self, title: str, year: str):
-        """
-        Iteruje po katalogu (napisy-katalog-<page>-wszystkie-<year>)
-        i zwraca listę krotek (id, pełny_tytuł, href)
-        """
         canon_title = re.sub(r"[^a-z0-9]", "", title.lower())
         results = []
         for page in range(1, MAX_PAGES + 1):
@@ -71,6 +61,7 @@ class NapiProjektKatalog:
             self.logger.debug(f"SEARCH katalog: {url}")
             r = self.session.get(url, timeout=15)
             if r.status_code != 200:
+                self.logger.debug(f"Katalog HTTP {r.status_code}")
                 break
             soup = BeautifulSoup(r.text, "lxml")
             blocks = soup.select("div.kategoria > div")
@@ -87,6 +78,7 @@ class NapiProjektKatalog:
                 m = re.search(r"-dla-(\d+)-", href)
                 if m:
                     nid = m.group(1)
+                    self.logger.debug(f"  ✓ dopasowano blok: «{hdr}» id={nid}")
                     results.append((nid, hdr, href))
             if results:
                 break
@@ -109,9 +101,10 @@ class NapiProjektKatalog:
 
     # ───────────────── detail page ───────────
     def _get_subtitles_from_detail(self, url: str):
-        self.logger.debug(f"DETAIL try: {url}")
+        self.logger.debug(f"DETAIL GET: {url}")
         r = self.session.get(url, timeout=15)
         if r.status_code != 200:
+            self.logger.debug(f"{url} HTTP {r.status_code}")
             return []
         soup = BeautifulSoup(r.text, "lxml")
         rows = soup.select("tbody tr")
@@ -119,8 +112,8 @@ class NapiProjektKatalog:
 
     # ───────────────── download hash ─────────
     def download(self, napisy_hash: str) -> str | None:
-        url = f"https://www.napiprojekt.pl/api/api-napiprojekt3.php"
-        self.logger.info(f"Pobieranie napisów: {napisy_hash}")
+        url = "https://www.napiprojekt.pl/api/api-napiprojekt3.php"
+        self.logger.debug(f"DOWNLOAD POST: {url} id={napisy_hash}")
         data = {
             "mode": "1",
             "client": "NapiProjektPython",
@@ -161,7 +154,7 @@ class NapiProjektKatalog:
     # ───────────────── public search ─────────
     def search(self, args: Dict) -> List[Dict]:
         imdb_id = args.get("imdb_id")
-        season = args.get("season")
+        season  = args.get("season")
         episode = args.get("episode")
 
         if not imdb_id:
@@ -184,22 +177,27 @@ class NapiProjektKatalog:
             self.logger.debug("Brak bloków z pasującym tytułem.")
             return []
 
-        subs = []
+        subs: List[Dict] = []
+        slug_title = title.replace(" ", "-")
         for nid, hdr, _ in blocks:
-            slug_title = title.replace(" ", "-")
-            base = (
-                f"https://www.napiprojekt.pl/napisy1,1,1-dla-"
-                f"{nid}-{slug_title}-({year})"
-            )
-            detail = (
-                f"{base}-s{season.zfill(2)}e{episode.zfill(2)}"
-                if season and episode
-                else base
-            )
+            base = f"https://www.napiprojekt.pl/napisy1,1,1-dla-{nid}-{slug_title}-({year})"
+            detail = f"{base}-s{season.zfill(2)}e{episode.zfill(2)}" if season and episode else base
             subs.extend(self._get_subtitles_from_detail(detail))
+
+            if not subs and season:
+                # fallback: tylko sezon
+                s_url = f"{base}-s{season.zfill(2)}"
+                self.logger.debug(f"DETAIL S-fallback GET: {s_url}")
+                subs.extend(self._get_subtitles_from_detail(s_url))
+
+            if not subs:
+                # fallback: bez sezonu i odcinka
+                p_url = base
+                self.logger.debug(f"DETAIL plain GET: {p_url}")
+                subs.extend(self._get_subtitles_from_detail(p_url))
+
             if len(subs) >= 100:
                 break
 
-        # sortujemy wg liczby pobrań malejąco
         subs.sort(key=lambda x: x.get("_downloads", 0), reverse=True)
         return subs[:100]
