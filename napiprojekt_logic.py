@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 NapiProjekt · wyszukiwanie napisów przez ajax/search_catalog.php
-Uwzględnia polski i oryginalny tytuł. Maksymalnie 100 wyników.
+• Obsługuje polski i oryginalny tytuł
+• Maks 100 wyników
 """
 
 from __future__ import annotations
@@ -162,17 +163,18 @@ class NapiProjektKatalog:
 
         candidates = []
         for blk in blocks:
-            h3 = blk.select_one(".movieTitleCat")
-            if not h3:
+            a = blk.select_one("a.movieTitleCat")
+            if not a:
                 continue
-            hdr = h3.text.strip()
+            hdr  = a.text.strip()
+            href = a.get("href", "")
             canon_hdr = get_clean(hdr)
             self.log.debug(f"⮞ {hdr} -> {canon_hdr}")
             if not any(wc in canon_hdr or canon_hdr in wc for wc in wanted_clean):
                 self.log.debug("   ✗ no‑match")
                 continue
             self.log.debug("   ✓ match")
-            m = re.search(r"-dla-(\d+)-", h3["href"])
+            m = re.search(r"-dla-(\d+)-", href)
             if m:
                 candidates.append(m.group(1))
 
