@@ -173,13 +173,9 @@ class NapiProjektKatalog:
 
         canon_wanted = get_clean(title)
         candidates = []
-        for blk in blocks:
-            h3 = blk.select_one(".movieTitleCat")
-            if not h3:
-                continue
-            hdr = h3.text.strip()
-            if get_clean(hdr) != canon_wanted:
-                continue
+        canon_hdr = get_clean(hdr)
+        if canon_wanted not in canon_hdr and canon_hdr not in canon_wanted:
+            continue
             href = h3["href"]
             m = re.search(r"-dla-(\d+)-", href)
             if not m:
