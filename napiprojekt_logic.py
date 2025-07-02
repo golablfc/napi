@@ -174,8 +174,8 @@ class NapiProjektKatalog:
         canon_wanted = get_clean(title)
         candidates = []
         canon_hdr = get_clean(hdr)
-        if canon_wanted not in canon_hdr and canon_hdr not in canon_wanted:
-            continue
+         if canon_wanted not in canon_hdr and canon_hdr not in canon_wanted:
+                continue
             href = h3["href"]
             m = re.search(r"-dla-(\d+)-", href)
             if not m:
