@@ -1,203 +1,144 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Logika wyszukiwania napisów na NapiProjekt z danymi z TMDB.
-Dodano obszerne logi DEBUG, aby śledzić każdy odwiedzany URL.
-"""
-
-import logging, re, time, base64, zlib, struct, requests
-from typing import List, Dict
+import re
+import requests
+import logging
 from bs4 import BeautifulSoup
+from utils import convert_subtitles, guess_fps_and_duration, get_duration_string
 
-from utils import (
-    parse_subtitles,
-    convert_microdvd,
-    convert_mpl2,
-    convert_timecoded,
-)
+log = logging.getLogger(__name__)
 
-TMDB_API_KEY = "d5d16ca655dd74bd22bbe412502a3815"
-MAX_PAGES = 50
-PAGE_DELAY = 0.15
-SESSION = requests.Session()
+BASE_URL = "https://www.napiprojekt.pl"
 
+def _normalize_title(title):
+    return re.sub(r"[^\w\s]", "", title.lower()).strip()
 
-class NapiProjektKatalog:
-    def __init__(self):
-        self.session = SESSION
-        self.logger = logging.getLogger("NapiProjekt")
-        self.logger.setLevel(logging.DEBUG)
+def _generate_candidate_urls(id_title, title, year, season=None, episode=None):
+    urls = []
 
-    # ───────────────── TMDB ──────────────────
-    def _fetch_tmdb_info(self, imdb_id):
-        url = (
-            f"https://api.themoviedb.org/3/find/{imdb_id}"
-            f"?api_key={TMDB_API_KEY}&language=pl&external_source=imdb_id"
-        )
-        self.logger.debug(f"TMDB request: {url}")
-        r = self.session.get(url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+    # Podstawowy adres
+    base = f"{BASE_URL}/napisy1,1,1-dla-{id_title}-{title}-({year})"
+    if season and episode:
+        urls.append(f"{base}-s{int(season):02d}e{int(episode):02d}")
+    urls.append(base)
+    return urls
 
-        for sec in ("tv_results", "movie_results"):
-            if data.get(sec):
-                obj = data[sec][0]
-                title = (obj.get("name") or obj.get("title") or "").strip()
-                date = obj.get("first_air_date") or obj.get("release_date") or ""
-                year = date[:4] if date else ""
-                self.logger.debug(f"TMDB (pl) -> title={title} year={year}")
-                return title, year
-        return None, None
+def _extract_blocks_from_detail(detail_html):
+    soup = BeautifulSoup(detail_html, "html.parser")
+    rows = soup.select("table#tblNapisy tr[class^='bg']")
+    return rows
 
-    # ───────────────── katalog NP ────────────
-    def _fetch_catalog_blocks(self, title: str, year: str):
-        canon_title = re.sub(r"[^a-z0-9]", "", title.lower())
-        results = []
-        for page in range(1, MAX_PAGES + 1):
-            url = (
-                f"https://www.napiprojekt.pl/napisy-katalog-"
-                f"{page}-wszystkie-{year}-0-0.html"
-            )
-            self.logger.debug(f"SEARCH katalog: {url}")
-            r = self.session.get(url, timeout=15)
-            if r.status_code != 200:
-                self.logger.debug(f"Katalog HTTP {r.status_code}")
-                break
-            soup = BeautifulSoup(r.text, "lxml")
-            blocks = soup.select("div.kategoria > div")
-            self.logger.debug(f"SEARCH blocks: {len(blocks)} page={page}")
-            for blk in blocks:
-                a = blk.select_one(".movieTitleCat")
-                if not a:
-                    continue
-                hdr = a.text.strip()
-                canon_hdr = re.sub(r"[^a-z0-9]", "", hdr.lower())
-                if canon_title not in canon_hdr and canon_hdr not in canon_title:
-                    continue
-                href = a["href"]
-                m = re.search(r"-dla-(\d+)-", href)
-                if m:
-                    nid = m.group(1)
-                    self.logger.debug(f"  ✓ dopasowano blok: «{hdr}» id={nid}")
-                    results.append((nid, hdr, href))
-            if results:
-                break
-            time.sleep(PAGE_DELAY)
-        return results
+def _parse_block(row):
+    tds = row.find_all("td")
+    if len(tds) < 6:
+        return None
 
-    # ───────────────── decrypt helper ────────
-    @staticmethod
-    def _decrypt_np(payload: bytes) -> str:
-        key = [0x5E, 0x34, 0x45, 0x43, 0x52, 0x45, 0x54, 0x5F]
-        blk = bytearray(payload)
-        for i in range(len(blk)):
-            blk[i] ^= key[i % 8]
-            blk[i] = ((blk[i] << 4) & 0xFF) | (blk[i] >> 4)
-        crc = struct.unpack("<I", blk[:4])[0]
-        data = blk[4:]
-        if zlib.crc32(data) & 0xFFFFFFFF != crc:
-            raise ValueError("CRC mismatch")
-        return zlib.decompress(data, -zlib.MAX_WBITS).decode("utf-8", "ignore")
+    link_tag = tds[0].find("a", href=True)
+    if not link_tag:
+        return None
 
-    # ───────────────── detail page ───────────
-    def _get_subtitles_from_detail(self, url: str):
-        self.logger.debug(f"DETAIL GET: {url}")
-        r = self.session.get(url, timeout=15)
-        if r.status_code != 200:
-            self.logger.debug(f"{url} HTTP {r.status_code}")
-            return []
-        soup = BeautifulSoup(r.text, "lxml")
-        rows = soup.select("tbody tr")
-        return parse_subtitles(rows)
+    href = link_tag["href"]
+    subtitle_id_match = re.search(r"([a-f0-9]{32})", href)
+    if not subtitle_id_match:
+        return None
 
-    # ───────────────── download hash ─────────
-    def download(self, napisy_hash: str) -> str | None:
-        url = "https://www.napiprojekt.pl/api/api-napiprojekt3.php"
-        self.logger.debug(f"DOWNLOAD POST: {url} id={napisy_hash}")
-        data = {
-            "mode": "1",
-            "client": "NapiProjektPython",
-            "downloaded_subtitles_id": napisy_hash,
-            "downloaded_subtitles_lang": "PL",
-            "downloaded_subtitles_txt": "1",
-        }
-        r = self.session.post(url, data=data, timeout=20)
-        if r.status_code != 200:
-            self.logger.error(f"Download HTTP {r.status_code}")
-            return None
-        xml_content = r.text
-        m = re.search(r"<content>(.*?)</content>", xml_content, re.S)
-        if not m:
-            self.logger.error("Download: no <content>")
-            return None
-        payload = base64.b64decode(m.group(1))
-        if payload.startswith(b"NP"):
-            try:
-                raw = self._decrypt_np(payload[4:])
-            except Exception as e:
-                self.logger.error(f"NP decrypt error: {e}")
-                return None
-        else:
-            try:
-                raw = payload.decode("utf-8")
-            except UnicodeDecodeError:
-                raw = payload.decode("cp1250", "ignore")
+    subtitle_id = subtitle_id_match.group(1)
+    download_link = f"{BASE_URL}/bin/napisy/{subtitle_id}.zip"
 
-        if "{" in raw:
-            return convert_microdvd(raw)
-        if "[" in raw:
-            return convert_mpl2(raw)
-        if re.search(r"\d{1,2}:\d{2}:\d{2}\s*:", raw):
-            return convert_timecoded(raw)
-        return raw
+    fps = tds[2].text.strip()
+    downloads = tds[3].text.strip()
+    lang = tds[4].text.strip()
+    filename = tds[5].text.strip()
 
-    # ───────────────── public search ─────────
-    def search(self, args: Dict) -> List[Dict]:
-        imdb_id = args.get("imdb_id")
-        season  = args.get("season")
-        episode = args.get("episode")
+    return {
+        "id": subtitle_id,
+        "link": download_link,
+        "fps": fps,
+        "downloads": int(downloads.replace(" ", "")) if downloads else 0,
+        "lang": lang,
+        "filename": filename
+    }
 
-        if not imdb_id:
-            self.logger.info("Brak imdb_id – przerywam.")
-            return []
+def _fetch_subtitles_from_detail_page(url):
+    log.debug(f"DETAIL try: {url}")
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        log.debug(f"DETAIL {url}: HTTP {resp.status_code}")
+        return []
 
-        title, year = self._fetch_tmdb_info(imdb_id)
-        if not title or not year:
-            self.logger.info("TMDB nie zwrócił tytułu/roku.")
-            return []
+    blocks = _extract_blocks_from_detail(resp.text)
+    if not blocks:
+        log.debug(f"DETAIL {url}: brak wierszy")
+        return []
 
-        self.logger.info(
-            f"Searching NapiProjekt with: "
-            f"{{'imdb_id': '{imdb_id}', 'tvshow': '{title}', 'year': '{year}', "
-            f"'season': '{season}', 'episode': '{episode}'}}"
-        )
+    parsed = list(filter(None, (_parse_block(row) for row in blocks)))
+    return parsed
 
-        blocks = self._fetch_catalog_blocks(title, year)
-        if not blocks:
-            self.logger.debug("Brak bloków z pasującym tytułem.")
-            return []
+def search_subtitles(meta):
+    log.info(f"Searching NapiProjekt with: {meta}")
+    results = []
 
-        subs: List[Dict] = []
-        slug_title = title.replace(" ", "-")
-        for nid, hdr, _ in blocks:
-            base = f"https://www.napiprojekt.pl/napisy1,1,1-dla-{nid}-{slug_title}-({year})"
-            detail = f"{base}-s{season.zfill(2)}e{episode.zfill(2)}" if season and episode else base
-            subs.extend(self._get_subtitles_from_detail(detail))
+    title = meta.get("tvshow") or meta.get("title")
+    year = meta.get("year")
+    season = meta.get("season")
+    episode = meta.get("episode")
 
-            if not subs and season:
-                # fallback: tylko sezon
-                s_url = f"{base}-s{season.zfill(2)}"
-                self.logger.debug(f"DETAIL S-fallback GET: {s_url}")
-                subs.extend(self._get_subtitles_from_detail(s_url))
+    if not title or not year:
+        log.warning("Brak tytułu lub roku – pomijam wyszukiwanie")
+        return []
 
-            if not subs:
-                # fallback: bez sezonu i odcinka
-                p_url = base
-                self.logger.debug(f"DETAIL plain GET: {p_url}")
-                subs.extend(self._get_subtitles_from_detail(p_url))
+    id_map = {
+        "Gra o tron": "26704",
+        "Nasza planeta": "55875",
+        "Infiltracja": "4576",
+        "Ong-Bak": "2634"
+    }
 
-            if len(subs) >= 100:
-                break
+    id_title = id_map.get(title)
+    if not id_title:
+        log.warning(f"Brak ID w mapie dla: {title}")
+        return []
 
-        subs.sort(key=lambda x: x.get("_downloads", 0), reverse=True)
-        return subs[:100]
+    candidate_urls = _generate_candidate_urls(id_title, title.replace(" ", "-"), year, season, episode)
+
+    all_subs = []
+    for url in candidate_urls:
+        subs = _fetch_subtitles_from_detail_page(url)
+        all_subs.extend(subs)
+
+    if not all_subs:
+        log.debug("Brak napisów na wszystkich sprawdzonych stronach.")
+        return []
+
+    log.info(f"Found {len(all_subs)} subtitles total")
+
+    converted = []
+    for sub in all_subs:
+        try:
+            content = convert_subtitles(sub["link"])
+            if "-->" not in content:
+                log.debug(f"Pomijam brak timestampów: {sub['filename']}")
+                continue
+            fps, duration = guess_fps_and_duration(content)
+            duration_str = get_duration_string(duration)
+            converted.append({
+                "id": sub["id"],
+                "lang": f"{duration_str} · PL",
+                "url": f"http://localhost:7002/subtitles/{sub['id']}.vtt",
+                "name": f"{sub['filename']} ({sub['fps']} FPS, {sub['downloads']} pobrań)"
+            })
+        except Exception as e:
+            log.debug(f"Błąd przy konwersji: {e}")
+            continue
+
+    # Sortuj po liczbie pobrań
+    converted.sort(key=lambda x: int(re.search(r"(\d+) pobrań", x["name"]).group(1)), reverse=True)
+
+    return converted[:100]
+
+def download_subtitle(sub_id):
+    url = f"{BASE_URL}/bin/napisy/{sub_id}.zip"
+    log.info(f"Pobieranie napisów: {sub_id}")
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        log.error(f"Nie udało się pobrać napisów: {sub_id}")
+        return None
+    return resp.content
