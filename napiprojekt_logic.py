@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NapiProjekt · wyszukiwanie napisów przez ajax/search_catalog.php
-• Obsługuje polski i oryginalny tytuł
-• Maks 100 wyników
+NapiProjekt – wyszukiwanie napisów (logika jak w dodatku Kodi homik)
+• Pobiera polski i angielski tytuł z TMDb
+• Szuka ID przez ajax/search_catalog.php
+• Buduje URL detail napisy1,1,1-dla-<ID>-...
+• Loguje każdy URL (debug)
 """
 
-from __future__ import annotations
 import logging, re, time, base64, zlib, struct, unicodedata, requests
-from typing import Dict, List
+from typing import List, Dict
 from bs4 import BeautifulSoup
 
 from utils import (
-    parse_subtitles,
     convert_microdvd,
     convert_mpl2,
     convert_timecoded,
 )
 
+# ───────── konfiguracja ─────────────────────────────────────
 TMDB_KEY  = "d5d16ca655dd74bd22bbe412502a3815"
 NP_AJAX   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
 NP_API    = "https://www.napiprojekt.pl/api/api-napiprojekt3.php"
@@ -29,33 +30,30 @@ SESSION   = requests.Session()
 log = logging.getLogger("NapiProjekt")
 log.setLevel(logging.DEBUG)
 
-# ───────── normalizacja ──────────────────────────────────────
-def _norm(t: str) -> str:
-    return unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode("ascii").lower()
+# ───────── helpers ──────────────────────────────────────────
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
 
-def getsearch(title: str) -> str:
-    t = _norm(title)
-    t = re.sub(r"[&'\".:\-]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+def clean_search(s: str) -> str:
+    s = _norm(s)
+    s = re.sub(r"[&'\".:\-]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-def get_clean(title: str) -> str:
-    t = _norm(title)
-    t = re.sub(r"\bthe\b", "", t)
-    t = re.sub(r"\(\d{4}\)", "", t)
-    t = re.sub(r"s\d{1,2}e\d{1,2}", "", t)
-    t = re.sub(r"[^\w]", "", t)
-    return t
+def clean_cmp(s: str) -> str:
+    s = _norm(s)
+    s = re.sub(r"\bthe\b", "", s)
+    s = re.sub(r"\(\d{4}\)", "", s)
+    s = re.sub(r"s\d{1,2}e\d{1,2}", "", s)
+    return re.sub(r"[^\w]", "", s)
 
-# ───────── decrypt helper NP ────────────────────────────────
 def _decrypt_np(blob: bytes) -> str:
     key = [0x5E,0x34,0x45,0x43,0x52,0x45,0x54,0x5F]
     b   = bytearray(blob)
     for i in range(len(b)):
         b[i] ^= key[i % 8]
         b[i]  = ((b[i] << 4) & 0xFF) | (b[i] >> 4)
-    crc   = struct.unpack("<I", b[:4])[0]
-    inner = b[4:]
+    crc,   = struct.unpack("<I", b[:4])
+    inner  = b[4:]
     if (zlib.crc32(inner) & 0xFFFFFFFF) != crc:
         raise ValueError("CRC mismatch")
     return zlib.decompress(inner, -zlib.MAX_WBITS).decode("utf-8", "ignore")
@@ -63,12 +61,12 @@ def _decrypt_np(blob: bytes) -> str:
 # ───────── klasa główna ─────────────────────────────────────
 class NapiProjektKatalog:
     def __init__(self):
-        self.s  = SESSION
+        self.s = SESSION
         self.log = log
 
-    # TMDb → (tytuł_PL, tytuł_EN, rok)
-    def _tmdb(self, imdb: str):
-        url = f"https://api.themoviedb.org/3/find/{imdb}?api_key={TMDB_KEY}&language=pl&external_source=imdb_id"
+    # TMDb -> (pl, en, year)
+    def _tmdb(self, imdb_id):
+        url = f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={TMDB_KEY}&language=pl&external_source=imdb_id"
         self.log.debug(f"TMDB GET: {url}")
         r = self.s.get(url, timeout=15)
         if r.status_code != 200:
@@ -76,20 +74,18 @@ class NapiProjektKatalog:
         js = r.json()
         for sec in ("tv_results", "movie_results"):
             if js.get(sec):
-                o    = js[sec][0]
-                t_pl = (o.get("name") or o.get("title") or "").strip()
-                t_en = (o.get("original_name") or o.get("original_title") or t_pl).strip()
+                o = js[sec][0]
+                pl = (o.get("name") or o.get("title") or "").strip()
+                en = (o.get("original_name") or o.get("original_title") or pl).strip()
                 date = o.get("first_air_date") or o.get("release_date") or ""
-                year = date[:4] if date else ""
-                self.log.debug(f"TMDB -> pl={t_pl} en={t_en} y={year}")
-                return t_pl, t_en, year
+                return pl, en, date[:4] if date else ""
         return None, None, None
 
     # AJAX search_catalog.php
-    def _ajax_blocks(self, title: str, year: str, is_series: bool):
+    def _ajax_blocks(self, title, year, is_series):
         data = {
             "queryKind": "1" if is_series else "2",
-            "queryString": getsearch(title),
+            "queryString": clean_search(title),
             "queryYear": "" if is_series else year,
             "associate": ""
         }
@@ -99,18 +95,16 @@ class NapiProjektKatalog:
             self.log.debug(f"AJAX HTTP {r.status_code}")
             return []
         soup = BeautifulSoup(r.text, "lxml")
-        blocks = soup.select("div.movieSearchContent")
-        self.log.debug(f"AJAX blocks: {len(blocks)}")
-        return blocks
+        return soup.select("div.movieSearchContent a.movieTitleCat")
 
-    # detail page -> subtitles list
-    def _detail(self, url: str):
+    # detail page → list of subtitles
+    def _detail(self, url):
         subs, seen = [], set()
         pat = re.compile(r"napisy\d+,")
-        for pg in range(1, MAX_PAGES + 1):
-            u = pat.sub(f"napisy{pg},", url, 1)
-            self.log.debug(f"DETAIL GET: {u}")
-            r = self.s.get(u, timeout=15)
+        for page in range(1, MAX_PAGES + 1):
+            pgurl = pat.sub(f"napisy{page},", url, 1)
+            self.log.debug(f"DETAIL GET: {pgurl}")
+            r = self.s.get(pgurl, timeout=15)
             if r.status_code != 200:
                 break
             rows = BeautifulSoup(r.text, "lxml").select("tbody tr")
@@ -131,21 +125,16 @@ class NapiProjektKatalog:
                     dls = int(re.sub(r"[^\d]", "", tds[4].text) or "0")
                 except ValueError:
                     dls = 0
-                subs.append({
-                    "link_hash": h,
-                    "label": tds[1].text.strip(),
-                    "_downloads": dls
-                })
+                subs.append({"link_hash": h, "label": tds[1].text.strip(), "_downloads": dls})
                 if len(subs) >= 100:
                     return subs
             time.sleep(DELAY)
         return subs
 
-    # ───────── PUBLIC API ──────────────────
+    # PUBLIC: search
     def search(self, meta: Dict) -> List[Dict]:
-        imdb    = meta.get("imdb_id")
-        season  = meta.get("season")
-        episode = meta.get("episode")
+        imdb = meta.get("imdb_id")
+        season, episode = meta.get("season"), meta.get("episode")
         if not imdb:
             return []
 
@@ -153,46 +142,49 @@ class NapiProjektKatalog:
         if not t_pl:
             return []
 
-        wanted_clean = [get_clean(t_pl)]
-        if t_en and t_en.lower() != t_pl.lower():
-            wanted_clean.append(get_clean(t_en))
+        wanted = [clean_cmp(t_pl)]
+        if t_en.lower() != t_pl.lower():
+            wanted.append(clean_cmp(t_en))
 
         blocks = self._ajax_blocks(t_pl, year, bool(season))
-        if not blocks:
-            return []
+        self.log.debug(f"AJAX blocks: {len(blocks)}")
+        cand_ids = []
 
-        candidates = []
-        for blk in blocks:
-            a = blk.select_one("a.movieTitleCat")
-            if not a:
-                continue
-            hdr  = a.text.strip()
-            href = a.get("href", "")
-            canon_hdr = get_clean(hdr)
+        for a in blocks:
+            hdr = a.text.strip()
+            canon_hdr = clean_cmp(hdr)
             self.log.debug(f"⮞ {hdr} -> {canon_hdr}")
-            if not any(wc in canon_hdr or canon_hdr in wc for wc in wanted_clean):
-                self.log.debug("   ✗ no‑match")
+            if not any(w in canon_hdr or canon_hdr in w for w in wanted):
+                self.log.debug("   ✗ no-match")
                 continue
-            self.log.debug("   ✓ match")
+            href = a.get("href", "")
+            self.log.debug(f"   href={href}")
             m = re.search(r"-dla-(\d+)-", href)
             if m:
-                candidates.append(m.group(1))
+                cid = m.group(1)
+                self.log.debug(f"   ✓ ID={cid}")
+                cand_ids.append(cid)
+            else:
+                self.log.debug("   ✗ brak -dla-")
 
-        if not candidates:
+        if not cand_ids:
+            self.log.info("Found 0 subtitles total")
             return []
 
         slug = t_pl.replace(" ", "-")
-        subs = []
-        for nid in candidates:
-            base = f"{NP_BASE}/napisy1,1,1-dla-{nid}-{slug}-({year})"
-            url  = f"{base}-s{season.zfill(2)}e{episode.zfill(2)}" if season and episode else base
-            subs.extend(self._detail(url))
-            if len(subs) >= 100:
+        all_subs = []
+        for cid in cand_ids:
+            base = f"{NP_BASE}/napisy1,1,1-dla-{cid}-{slug}-({year})"
+            url = f"{base}-s{season.zfill(2)}e{episode.zfill(2)}" if season and episode else base
+            all_subs.extend(self._detail(url))
+            if len(all_subs) >= 100:
                 break
 
-        subs.sort(key=lambda x: x.get("_downloads", 0), reverse=True)
-        return subs[:100]
+        all_subs.sort(key=lambda x: x.get("_downloads", 0), reverse=True)
+        self.log.info(f"Found {len(all_subs)} subtitles total")
+        return all_subs[:100]
 
+    # PUBLIC: download by hash
     def download(self, h: str) -> str | None:
         data = {
             "mode": "17",
@@ -201,6 +193,7 @@ class NapiProjektKatalog:
             "downloaded_subtitles_lang": "PL",
             "downloaded_subtitles_txt": "1",
         }
+        self.log.debug(f"DOWNLOAD POST: {NP_API} id={h}")
         r = self.s.post(NP_API, data=data, timeout=20)
         if r.status_code != 200:
             return None
