@@ -13,6 +13,13 @@ class NapiProjektKatalog:
         self.download_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
         self.search_url   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
         self.base_url     = "https://www.napiprojekt.pl"
+        
+        # NOWOŚĆ: Udajemy prawdziwą przeglądarkę, by uniknąć błędu 403 Forbidden
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        }
         self.logger.info("NapiProjektKatalog initialized")
 
     # ───────────────────────────────────────── helpery
@@ -33,12 +40,6 @@ class NapiProjektKatalog:
 
     # ───────────────────────────────────────── simple HH:MM:SS:TEXT → SRT
     def _convert_simple_time_to_srt(self, txt: str) -> Optional[str]:
-        """
-        Format linii: HH:MM:SS:Tekst   (np. 00:03:06:Szybciej...)
-        • Start = podany czas.
-        • Koniec = początek kolejnej linii - 0.01 s
-        • Ostatnia linia = +3 s
-        """
         line_pat = re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*:\s*(.*)$")
         items = []
         for ln in txt.splitlines():
@@ -51,7 +52,7 @@ class NapiProjektKatalog:
             items.append((start, text))
 
         if len(items) < 2:
-            return None  # nie wygląda na ten format
+            return None
 
         srt = []
         for idx, (start, text) in enumerate(items):
@@ -66,31 +67,17 @@ class NapiProjektKatalog:
         return "\n".join(srt)
 
     # ───────────────────────────────────────── MicroDVD / MPL2 → SRT
-    def _convert_microdvd_to_srt(
-        self,
-        txt: str,
-        fps_default: float = 23.976,
-    ) -> Optional[str]:
-        """
-        • {start}{end}  → MicroDVD  (klatki)   — FPS z nagłówka {0}{0}xx.xx lub domyślnie 23.976
-        • [start][end]
-            – z nagłówkiem [0][0]xx.xx         → MicroDVD‑square (klatki)
-            – bez nagłówka                    → MPL2 (dziesiąte sekundy)
-        • Jeśli brak { } i [ ], próbujemy HH:MM:SS:Tekst
-        """
-
+    def _convert_microdvd_to_srt(self, txt: str, fps_default: float = 23.976) -> Optional[str]:
         if not txt or "-->" in txt:
-            return txt  # już SRT lub puste
+            return txt
 
-        # ─── 1) Simple time format?
         if "{" not in txt and "[" not in txt:
             simple = self._convert_simple_time_to_srt(txt)
             if simple:
-                return simple  # skonwertowany prosty format
+                return simple
 
-        # ─── 2) MicroDVD / MPL2
         line_pat = re.compile(r"([{\[])(\d+)[}\]]([{\[])(\d+)[}\]](.*)")
-        items: List[tuple] = []        # (bracket, a, b, body)
+        items: List[tuple] = []
         fps_header: Optional[float] = None
 
         for ln in txt.splitlines():
@@ -100,7 +87,6 @@ class NapiProjektKatalog:
             br, a_raw, _, b_raw, body = m.groups()
             a, b = int(a_raw), int(b_raw)
 
-            # Nagłówek FPS {0}{0}xx.xx lub [0][0]xx.xx
             if a == 0 and b == 0:
                 m_fps = re.search(r"(\d+(?:\.\d+)?)", body)
                 if m_fps:
@@ -118,21 +104,19 @@ class NapiProjektKatalog:
 
         first_br = items[0][0]
 
-        # Ustalenie trybu
         if first_br == "{":
             mode = "frames"
             fps  = fps_header or fps_default
-        else:  # '['
+        else:
             if fps_header:
                 mode = "frames"
                 fps  = fps_header
             else:
-                mode = "mpl2"       # wartości w 0.1 s
+                mode = "mpl2"
                 fps  = None
 
         self.logger.debug(f"Mode: {mode}, FPS: {fps}")
 
-        # Konwersja
         srt_lines = []
         idx = 1
         for _, a, b, body in items:
@@ -143,7 +127,7 @@ class NapiProjektKatalog:
             if mode == "frames":
                 t1 = self._format_time(a / fps)
                 t2 = self._format_time(b / fps)
-            else:            # MPL2: dziesiąte sekundy
+            else:
                 t1 = self._format_time(a / 10)
                 t2 = self._format_time(b / 10)
 
@@ -191,8 +175,10 @@ class NapiProjektKatalog:
                     "downloaded_subtitles_txt": "1",
                 }
             ).encode("utf-8")
+            
+            # Dodano self.headers
             req = urllib.request.Request(
-                self.download_url, data=data, headers={"User-Agent": "Mozilla/5.0"}
+                self.download_url, data=data, headers=self.headers
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status != 200:
@@ -215,20 +201,6 @@ class NapiProjektKatalog:
                 except UnicodeDecodeError:
                     raw = bin_data.decode("cp1250", "ignore")
 
-            # debug raw
-            try:
-                os.makedirs("debug_raw", exist_ok=True)
-                with open(
-                    f"debug_raw/debug_{md5hash}.txt",
-                    "w",
-                    encoding="utf-8",
-                    errors="ignore",
-                ) as dbg:
-                    dbg.write(raw)
-            except Exception:
-                pass
-
-            # konwersja
             if "{" in raw or "[" in raw or re.search(r"^\s*\d{1,2}:\d{2}:\d{2}\s*:", raw, re.M):
                 raw = self._convert_microdvd_to_srt(raw) or raw
             return raw
@@ -236,7 +208,7 @@ class NapiProjektKatalog:
             self.logger.error(f"Download err {md5hash}: {e}")
             return None
 
-    # ───────────────────────────────────────── SEARCH (bez zmian)
+    # ───────────────────────────────────────── SEARCH
     def _build_detail_url(self, item, href):
         m = re.search(r"napisy-(\d+)-(.*)", href)
         if not m:
@@ -257,7 +229,9 @@ class NapiProjektKatalog:
         page = 1
         while True:
             pg = url.replace("napisy1,", f"napisy{page},")
-            req = urllib.request.Request(pg, headers={"User-Agent": "Mozilla/5.0"})
+            
+            # Dodano self.headers
+            req = urllib.request.Request(pg, headers=self.headers)
             with urllib.request.urlopen(req, timeout=15) as resp:
                 soup = BeautifulSoup(resp.read(), "lxml")
             rows = soup.select("tbody > tr")
@@ -303,8 +277,10 @@ class NapiProjektKatalog:
                     "associate": imdb_id,
                 }
             ).encode("utf-8")
+            
+            # Dodano self.headers
             req = urllib.request.Request(
-                self.search_url, data=post, headers={"User-Agent": "Mozilla/5.0"}
+                self.search_url, data=post, headers=self.headers
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 html = resp.read().decode("utf-8")
