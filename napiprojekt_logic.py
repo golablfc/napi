@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import urllib.request, urllib.parse, re, base64, logging, zlib, struct, time, os
+import re
+import base64
+import logging
+import zlib
+import struct
+import time
+import os
+import requests
 from xml.dom import minidom
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
@@ -14,11 +21,11 @@ class NapiProjektKatalog:
         self.search_url   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
         self.base_url     = "https://www.napiprojekt.pl"
         
-        # NOWOŚĆ: Udajemy prawdziwą przeglądarkę, by uniknąć błędu 403 Forbidden
+        # Nagłówki udające nowoczesną przeglądarkę Chrome
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            "Referer": "https://www.napiprojekt.pl/"
         }
         self.logger.info("NapiProjektKatalog initialized")
 
@@ -38,7 +45,7 @@ class NapiProjektKatalog:
         ms = int(round((sec - int(sec)) * 1000))
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    # ───────────────────────────────────────── simple HH:MM:SS:TEXT → SRT
+    # ───────────────────────────────────────── konwersja do SRT
     def _convert_simple_time_to_srt(self, txt: str) -> Optional[str]:
         line_pat = re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2})\s*:\s*(.*)$")
         items = []
@@ -59,14 +66,9 @@ class NapiProjektKatalog:
             if not text:
                 continue
             end = (items[idx + 1][0] - 0.01) if idx + 1 < len(items) else start + 3
-            srt.append(
-                f"{idx + 1}\n"
-                f"{self._format_time(start)} --> {self._format_time(end)}\n"
-                f"{text}\n"
-            )
+            srt.append(f"{idx + 1}\n{self._format_time(start)} --> {self._format_time(end)}\n{text}\n")
         return "\n".join(srt)
 
-    # ───────────────────────────────────────── MicroDVD / MPL2 → SRT
     def _convert_microdvd_to_srt(self, txt: str, fps_default: float = 23.976) -> Optional[str]:
         if not txt or "-->" in txt:
             return txt
@@ -92,7 +94,6 @@ class NapiProjektKatalog:
                 if m_fps:
                     try:
                         fps_header = float(m_fps.group(1))
-                        self.logger.debug(f"FPS header detected: {fps_header}")
                     except ValueError:
                         pass
                 continue
@@ -103,19 +104,13 @@ class NapiProjektKatalog:
             return None
 
         first_br = items[0][0]
-
         if first_br == "{":
-            mode = "frames"
-            fps  = fps_header or fps_default
+            mode, fps = "frames", fps_header or fps_default
         else:
             if fps_header:
-                mode = "frames"
-                fps  = fps_header
+                mode, fps = "frames", fps_header
             else:
-                mode = "mpl2"
-                fps  = None
-
-        self.logger.debug(f"Mode: {mode}, FPS: {fps}")
+                mode, fps = "mpl2", None
 
         srt_lines = []
         idx = 1
@@ -123,14 +118,8 @@ class NapiProjektKatalog:
             text = "\n".join(seg.lstrip('/').strip() for seg in body.split('|') if seg.strip())
             if not text:
                 continue
-
-            if mode == "frames":
-                t1 = self._format_time(a / fps)
-                t2 = self._format_time(b / fps)
-            else:
-                t1 = self._format_time(a / 10)
-                t2 = self._format_time(b / 10)
-
+            t1 = self._format_time(a / fps) if mode == "frames" else self._format_time(a / 10)
+            t2 = self._format_time(b / fps) if mode == "frames" else self._format_time(b / 10)
             srt_lines.append(f"{idx}\n{t1} --> {t2}\n{text}\n")
             idx += 1
 
@@ -138,23 +127,16 @@ class NapiProjektKatalog:
 
     # ───────────────────────────────────────── parse helpery
     def _parse_duration(self, txt: str) -> Optional[float]:
-        if not txt:
-            return None
+        if not txt: return None
         try:
-            if txt.isdigit():
-                return int(txt) / 1000
+            if txt.isdigit(): return int(txt) / 1000
             if "." in txt:
                 t, frac = txt.split(".", 1)
                 ms = int(frac[:3].ljust(3, "0"))
             else:
                 t, ms = txt, 0
             parts = list(map(int, t.split(":")))
-            if len(parts) == 3:
-                h, m, s = parts
-            elif len(parts) == 2:
-                h, m, s = 0, *parts
-            else:
-                return None
+            h, m, s = (parts if len(parts) == 3 else [0] + parts)
             return h * 3600 + m * 60 + s + ms / 1000
         except Exception:
             return None
@@ -166,25 +148,17 @@ class NapiProjektKatalog:
     # ───────────────────────────────────────── DOWNLOAD
     def download(self, md5hash: str) -> Optional[str]:
         try:
-            data = urllib.parse.urlencode(
-                {
-                    "mode": "17",
-                    "client": "NapiProjektPython",
-                    "downloaded_subtitles_id": md5hash,
-                    "downloaded_subtitles_lang": "PL",
-                    "downloaded_subtitles_txt": "1",
-                }
-            ).encode("utf-8")
+            payload = {
+                "mode": "17",
+                "client": "NapiProjektPython",
+                "downloaded_subtitles_id": md5hash,
+                "downloaded_subtitles_lang": "PL",
+                "downloaded_subtitles_txt": "1",
+            }
+            resp = requests.post(self.download_url, data=payload, headers=self.headers, timeout=15)
+            if resp.status_code != 200: return None
             
-            # Dodano self.headers
-            req = urllib.request.Request(
-                self.download_url, data=data, headers=self.headers
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status != 200:
-                    return None
-                xml = minidom.parseString(resp.read())
-
+            xml = minidom.parseString(resp.content)
             content = xml.getElementsByTagName("content")[0].firstChild.data
             bin_data = base64.b64decode(content)
 
@@ -192,8 +166,7 @@ class NapiProjektKatalog:
                 dec = self._decrypt(bin_data[4:])
                 crc = struct.unpack("<I", dec[:4])[0]
                 inner = dec[4:]
-                if zlib.crc32(inner) & 0xFFFFFFFF != crc:
-                    return None
+                if zlib.crc32(inner) & 0xFFFFFFFF != crc: return None
                 raw = zlib.decompress(inner, -zlib.MAX_WBITS).decode("utf-8", "ignore")
             else:
                 try:
@@ -211,15 +184,12 @@ class NapiProjektKatalog:
     # ───────────────────────────────────────── SEARCH
     def _build_detail_url(self, item, href):
         m = re.search(r"napisy-(\d+)-(.*)", href)
-        if not m:
-            return urllib.parse.urljoin(self.base_url, href)
+        if not m: return f"{self.base_url}{href}"
         nid, slug = m.groups()
         slug = re.sub(r"[-\s]*\(?\d{4}\)?$", "", slug).strip("-")
         base = f"{self.base_url}/napisy1,1,1-dla-{nid}-{slug}"
         if item.get("tvshow") and item.get("season") and item.get("episode"):
-            s = item["season"].zfill(2)
-            e = item["episode"].zfill(2)
-            return f"{base}-s{s}e{e}"
+            return f"{base}-s{item['season'].zfill(2)}e{item['episode'].zfill(2)}"
         if item.get("year"):
             return f"{base}-({item['year']})"
         return base
@@ -229,71 +199,61 @@ class NapiProjektKatalog:
         page = 1
         while True:
             pg = url.replace("napisy1,", f"napisy{page},")
+            resp = requests.get(pg, headers=self.headers, timeout=15)
+            if resp.status_code != 200: break
             
-            # Dodano self.headers
-            req = urllib.request.Request(pg, headers=self.headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                soup = BeautifulSoup(resp.read(), "lxml")
+            soup = BeautifulSoup(resp.text, "lxml")
             rows = soup.select("tbody > tr")
-            if not rows:
-                break
+            if not rows: break
+            
             for row in rows:
                 a = row.find("a", href=re.compile(r"napiprojekt:"))
-                if not a:
-                    continue
+                if not a: continue
                 cols = row.find_all("td")
-                if len(cols) < 5:
-                    continue
-                duration = cols[3].get_text(strip=True)
-                dls_txt = cols[4].get_text(strip=True)
+                if len(cols) < 5: continue
+                
                 try:
-                    dls_num = int(re.sub(r"[^\d]", "", dls_txt)) or 0
+                    dls_num = int(re.sub(r"[^\d]", "", cols[4].get_text(strip=True))) or 0
                 except Exception:
                     dls_num = 0
-                subs.append(
-                    {
-                        "language": "pol",
-                        "label": cols[1].get_text(strip=True),
-                        "link_hash": a["href"].replace("napiprojekt:", ""),
-                        "_duration": self._parse_duration(duration),
-                        "_fps": self._extract_fps_from_label(cols[2].get_text(strip=True)),
-                        "_downloads": dls_num,
-                    }
-                )
+                    
+                subs.append({
+                    "language": "pol",
+                    "label": cols[1].get_text(strip=True),
+                    "link_hash": a["href"].replace("napiprojekt:", ""),
+                    "_duration": self._parse_duration(cols[3].get_text(strip=True)),
+                    "_fps": self._extract_fps_from_label(cols[2].get_text(strip=True)),
+                    "_downloads": dls_num,
+                })
             page += 1
-            time.sleep(1)
+            if page > 5: break # Zabezpieczenie przed pętlą
+            time.sleep(0.5)
         return subs
 
     def search(self, item: Dict[str, str], imdb_id: str, *_) -> List[dict]:
         try:
-            q_kind = "1" if item.get("tvshow") else "2"
-            q_str = (item.get("tvshow") or item.get("title") or imdb_id).lower()
-            q_year = item.get("year", "")
-            post = urllib.parse.urlencode(
-                {
-                    "queryKind": q_kind,
-                    "queryString": q_str,
-                    "queryYear": q_year,
-                    "associate": imdb_id,
-                }
-            ).encode("utf-8")
+            payload = {
+                "queryKind": "1" if item.get("tvshow") else "2",
+                "queryString": (item.get("tvshow") or item.get("title") or imdb_id).lower(),
+                "queryYear": item.get("year", ""),
+                "associate": imdb_id,
+            }
             
-            # Dodano self.headers
-            req = urllib.request.Request(
-                self.search_url, data=post, headers=self.headers
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8")
-            soup = BeautifulSoup(html, "lxml")
+            resp = requests.post(self.search_url, data=payload, headers=self.headers, timeout=15)
+            if resp.status_code != 200:
+                self.logger.error(f"Search failed: {resp.status_code}")
+                return []
+                
+            soup = BeautifulSoup(resp.text, "lxml")
             blocks = soup.find_all("div", class_="movieSearchContent")
             result = []
             for blk in blocks:
-                a = blk.find("a", href=re.compile(r"imdb.com/title/(tt\d+)"))
-                if not a or imdb_id not in a["href"]:
-                    continue
+                a_imdb = blk.find("a", href=re.compile(r"imdb.com/title/(tt\d+)"))
+                if not a_imdb or imdb_id not in a_imdb["href"]: continue
+                
                 title_a = blk.find("a", class_="movieTitleCat")
-                if not title_a:
-                    continue
+                if not title_a: continue
+                
                 detail = self._build_detail_url(item, title_a["href"])
                 if detail:
                     result.extend(self._get_subtitles_from_detail(detail))
