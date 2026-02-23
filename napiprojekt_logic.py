@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import re
-import base64
-import logging
-import zlib
-import struct
-import time
-import requests
+import urllib.request, urllib.parse, re, base64, logging, zlib, struct, time
 from xml.dom import minidom
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
@@ -18,18 +12,6 @@ class NapiProjektKatalog:
         self.download_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
         self.search_url   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
         self.base_url     = "https://www.napiprojekt.pl"
-        
-        # Udajemy przeglądarkę identycznie jak Kodi, ale z dodatkowymi polami
-        self.headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://www.napiprojekt.pl/"
-        }
-        self.session = requests.Session()
-        self.logger.info("NapiProjektKatalog initialized")
 
     def _decrypt(self, data: bytes) -> bytes:
         key = [0x5E,0x34,0x45,0x43,0x52,0x45,0x54,0x5F]
@@ -48,7 +30,6 @@ class NapiProjektKatalog:
     def _parse_duration(self, txt: str) -> Optional[float]:
         if not txt: return None
         try:
-            if txt.isdigit(): return int(txt) / 1000
             parts = list(map(int, txt.split(":")))
             h, m, s = (parts if len(parts) == 3 else [0] + parts)
             return h * 3600 + m * 60 + s
@@ -56,20 +37,20 @@ class NapiProjektKatalog:
 
     def download(self, md5hash: str) -> Optional[str]:
         try:
-            payload = {
+            post_data = urllib.parse.urlencode({
                 "mode": "17",
                 "client": "NapiProjektPython",
                 "downloaded_subtitles_id": md5hash,
                 "downloaded_subtitles_lang": "PL",
                 "downloaded_subtitles_txt": "1",
-            }
-            resp = self.session.post(self.download_url, data=payload, headers=self.headers, timeout=10)
-            if resp.status_code != 200: return None
+            }).encode("utf-8")
             
-            xml = minidom.parseString(resp.content)
+            req = urllib.request.Request(self.download_url, data=post_data, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                xml = minidom.parseString(resp.read())
+
             content = xml.getElementsByTagName("content")[0].firstChild.data
             bin_data = base64.b64decode(content)
-
             if bin_data.startswith(b"NP"):
                 dec = self._decrypt(bin_data[4:])
                 inner = dec[4:]
@@ -77,16 +58,15 @@ class NapiProjektKatalog:
             else:
                 raw = bin_data.decode("utf-8", "ignore")
             return raw
-        except Exception as e:
-            self.logger.error(f"Download err: {e}")
-            return None
+        except: return None
 
     def _get_subtitles_from_detail(self, url: str) -> List[dict]:
         subs = []
         try:
-            # Używamy sesji, aby zachować ciągłość
-            resp = self.session.get(url, headers=self.headers, timeout=10)
-            soup = BeautifulSoup(resp.text, "lxml")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                soup = BeautifulSoup(resp.read(), "lxml")
+            
             rows = soup.select("tbody > tr")
             for row in rows:
                 a = row.find("a", href=re.compile(r"napiprojekt:"))
@@ -106,24 +86,19 @@ class NapiProjektKatalog:
 
     def search(self, item: Dict[str, str], imdb_id: str, *_) -> List[dict]:
         try:
-            # KROK 1: Najpierw "wchodzimy" na stronę główną, aby pobrać ciasteczka
-            self.session.get(self.base_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-            
-            # KROK 2: Wysyłamy właściwe zapytanie
-            payload = {
+            # DOKŁADNIE to samo co w service.py homika
+            post_data = urllib.parse.urlencode({
                 "queryKind": "1" if item.get("tvshow") else "2",
                 "queryString": (item.get("tvshow") or item.get("title") or imdb_id).lower(),
                 "queryYear": item.get("year", ""),
                 "associate": imdb_id,
-            }
+            }).encode("utf-8")
             
-            resp = self.session.post(self.search_url, data=payload, headers=self.headers, timeout=10)
+            req = urllib.request.Request(self.search_url, data=post_data, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8")
             
-            if resp.status_code != 200:
-                self.logger.error(f"Search failed: {resp.status_code}")
-                return []
-                
-            soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(html, "lxml")
             blocks = soup.find_all("div", class_="movieSearchContent")
             result = []
             for blk in blocks:
@@ -133,15 +108,15 @@ class NapiProjektKatalog:
                 title_a = blk.find("a", class_="movieTitleCat")
                 if not title_a: continue
                 
-                # Budujemy pełny URL do szczegółów
-                m = re.search(r"napisy-(\d+)-(.*)", title_a["href"])
+                # Budujemy URL detali (uproszczone)
+                href = title_a["href"]
+                m = re.search(r"napisy-(\d+)-(.*)", href)
                 if m:
                     nid, slug = m.groups()
                     slug = re.sub(r"[-\s]*\(?\d{4}\)?$", "", slug).strip("-")
                     detail_url = f"{self.base_url}/napisy1,1,1-dla-{nid}-{slug}"
                     if item.get("tvshow") and item.get("season"):
                         detail_url += f"-s{item['season'].zfill(2)}e{item['episode'].zfill(2)}"
-                    
                     result.extend(self._get_subtitles_from_detail(detail_url))
             return result
         except Exception as e:
