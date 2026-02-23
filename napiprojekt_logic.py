@@ -19,14 +19,18 @@ class NapiProjektKatalog:
         self.search_url   = "https://www.napiprojekt.pl/ajax/search_catalog.php"
         self.base_url     = "https://www.napiprojekt.pl"
         
-        # Używamy dokładnie takiego samego nagłówka jak w Kodi
+        # Udajemy przeglądarkę identycznie jak Kodi, ale z dodatkowymi polami
         self.headers = {
             "User-Agent": "Mozilla/5.0",
-            "Content-Type": "application/x-www-form-urlencoded"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.napiprojekt.pl/"
         }
+        self.session = requests.Session()
         self.logger.info("NapiProjektKatalog initialized")
 
-    # ───────────────────────────────────────── helpery
     def _decrypt(self, data: bytes) -> bytes:
         key = [0x5E,0x34,0x45,0x43,0x52,0x45,0x54,0x5F]
         dec = bytearray(data)
@@ -50,7 +54,6 @@ class NapiProjektKatalog:
             return h * 3600 + m * 60 + s
         except: return None
 
-    # ───────────────────────────────────────── DOWNLOAD
     def download(self, md5hash: str) -> Optional[str]:
         try:
             payload = {
@@ -60,7 +63,7 @@ class NapiProjektKatalog:
                 "downloaded_subtitles_lang": "PL",
                 "downloaded_subtitles_txt": "1",
             }
-            resp = requests.post(self.download_url, data=payload, headers=self.headers, timeout=10)
+            resp = self.session.post(self.download_url, data=payload, headers=self.headers, timeout=10)
             if resp.status_code != 200: return None
             
             xml = minidom.parseString(resp.content)
@@ -78,21 +81,11 @@ class NapiProjektKatalog:
             self.logger.error(f"Download err: {e}")
             return None
 
-    # ───────────────────────────────────────── SEARCH
-    def _build_detail_url(self, item, href):
-        m = re.search(r"napisy-(\d+)-(.*)", href)
-        if not m: return f"{self.base_url}{href}"
-        nid, slug = m.groups()
-        slug = re.sub(r"[-\s]*\(?\d{4}\)?$", "", slug).strip("-")
-        base = f"{self.base_url}/napisy1,1,1-dla-{nid}-{slug}"
-        if item.get("tvshow") and item.get("season") and item.get("episode"):
-            return f"{base}-s{item['season'].zfill(2)}e{item['episode'].zfill(2)}"
-        return base
-
     def _get_subtitles_from_detail(self, url: str) -> List[dict]:
         subs = []
         try:
-            resp = requests.get(url, headers=self.headers, timeout=10)
+            # Używamy sesji, aby zachować ciągłość
+            resp = self.session.get(url, headers=self.headers, timeout=10)
             soup = BeautifulSoup(resp.text, "lxml")
             rows = soup.select("tbody > tr")
             for row in rows:
@@ -113,7 +106,10 @@ class NapiProjektKatalog:
 
     def search(self, item: Dict[str, str], imdb_id: str, *_) -> List[dict]:
         try:
-            # Używamy DOKŁADNIE tych samych kluczy co w Kodi
+            # KROK 1: Najpierw "wchodzimy" na stronę główną, aby pobrać ciasteczka
+            self.session.get(self.base_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+            
+            # KROK 2: Wysyłamy właściwe zapytanie
             payload = {
                 "queryKind": "1" if item.get("tvshow") else "2",
                 "queryString": (item.get("tvshow") or item.get("title") or imdb_id).lower(),
@@ -121,9 +117,7 @@ class NapiProjektKatalog:
                 "associate": imdb_id,
             }
             
-            # Wymuszamy sesję, żeby zachować ciasteczka (częsty powód 403)
-            session = requests.Session()
-            resp = session.post(self.search_url, data=payload, headers=self.headers, timeout=10)
+            resp = self.session.post(self.search_url, data=payload, headers=self.headers, timeout=10)
             
             if resp.status_code != 200:
                 self.logger.error(f"Search failed: {resp.status_code}")
@@ -139,8 +133,16 @@ class NapiProjektKatalog:
                 title_a = blk.find("a", class_="movieTitleCat")
                 if not title_a: continue
                 
-                detail = self._build_detail_url(item, title_a["href"])
-                result.extend(self._get_subtitles_from_detail(detail))
+                # Budujemy pełny URL do szczegółów
+                m = re.search(r"napisy-(\d+)-(.*)", title_a["href"])
+                if m:
+                    nid, slug = m.groups()
+                    slug = re.sub(r"[-\s]*\(?\d{4}\)?$", "", slug).strip("-")
+                    detail_url = f"{self.base_url}/napisy1,1,1-dla-{nid}-{slug}"
+                    if item.get("tvshow") and item.get("season"):
+                        detail_url += f"-s{item['season'].zfill(2)}e{item['episode'].zfill(2)}"
+                    
+                    result.extend(self._get_subtitles_from_detail(detail_url))
             return result
         except Exception as e:
             self.logger.error(f"Search error: {e}")
