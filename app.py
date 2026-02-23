@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import re
-import logging
 import urllib.parse
-import base64
-
+import logging
 from typing import Dict
 from flask import Flask, jsonify, request, Response
 from waitress import serve
 
 from napiprojekt_logic import NapiProjektKatalog
-from utils import _fmt  # z utils.py – do labeli czasu jeśli zechcesz
 
 # ────────── konfiguracja logów ─────────────────────────────────
 logging.basicConfig(
@@ -24,7 +22,7 @@ log = logging.getLogger("ST‑NAPI")
 app = Flask(__name__)
 napi = NapiProjektKatalog()
 
-# ────────── pomocnicze parsowanie ID i parametrów ─────────────
+# ────────── pomocnicze parsowanie ID i parametrów ─────────────
 def parse_params(decoded_id: str) -> Dict[str, str]:
     if "/" not in decoded_id:
         return {}
@@ -52,9 +50,9 @@ def add_cors(resp):
 def manifest():
     return jsonify({
         "id": "org.stremio.napiprojekt.python",
-        "version": "6.0.0",
-        "name": "NapiProjekt PL · TMDB",
-        "description": "Napisy z NapiProjekt (ID wyciągane z katalogu NP, dane PL z TMDB).",
+        "version": "6.1.0",
+        "name": "NapiProjekt PL · Nuvio Ready",
+        "description": "Napisy z NapiProjekt z obsługą inteligentnego dopasowania po czasie trwania (Nuvio).",
         "resources": ["subtitles"],
         "types": ["movie", "series"],
         "catalogs": [],
@@ -75,27 +73,56 @@ def subtitles_list(ctype: str, imdb_plus: str):
         item: Dict[str, str] = {
             "imdb_id": imdb_id,
             "season": params.get("season", ""),
-            "episode": params.get("episode", "")
+            "episode": params.get("episode", ""),
+            "title": "" 
         }
 
-        # sezon/odcinek w formacie :Sxx:Eyy może być w path
+        # Pobranie czasu z Nuvio i zamiana na sekundy
+        target_duration_sec = None
+        if "durationms" in params:
+            target_duration_sec = float(params["durationms"]) / 1000.0
+            log.info(f"Nuvio mode active! Target duration: {target_duration_sec}s")
+
         se_match = re.search(r":(\d{1,2})(?::(\d{1,2}))?", decoded)
         if se_match and not item["season"]:
             item["season"] = se_match.group(1)
             item["episode"] = se_match.group(2) or ""
 
         log.info(f"Searching NapiProjekt with: {item}")
-        raw = napi.search(item)
+        
+        # Poprawione wywołanie z argumentem imdb_id
+        raw = napi.search(item, imdb_id)
         log.info(f"Found {len(raw)} subtitles total")
 
-        # sortowanie i listowanie
-        raw.sort(key=lambda s: (-s.get('_downloads', 0), s.get('_duration') or 0))
-        subtitles = [{
-            "id": f"{imdb_id}_{s['link_hash']}_pl",
-            "url": f"{request.url_root}subtitles/download/{s['link_hash']}.srt",
-            "lang": f"{hms(s.get('_duration'))} · PL",
-            "name": f"NapiProjekt · {s.get('_downloads', 0)}· pobrań · {s.get('_fps') or '?'} FPS"
-        } for s in raw]
+        # System punktacji (Scoring)
+        for s in raw:
+            s_score = s.get('_downloads', 0)
+            s_dur = s.get('_duration')
+
+            if target_duration_sec and s_dur:
+                diff = abs(target_duration_sec - s_dur)
+                if diff <= 0.1:
+                    s_score += 10000 
+                    s['perfect_match'] = True
+                elif diff <= 1.0:
+                    s_score += 5000
+
+            s['_score'] = s_score
+
+        # Sortowanie według najwyższego wyniku
+        raw.sort(key=lambda s: s.get('_score', 0), reverse=True)
+
+        subtitles = []
+        for s in raw:
+            # Oznaczamy idealnie dopasowane napisy w UI
+            prefix = "⭐ IDEALNE " if s.get('perfect_match') else ""
+            
+            subtitles.append({
+                "id": f"{imdb_id}_{s['link_hash']}_pl",
+                "url": f"{request.url_root}subtitles/download/{s['link_hash']}.srt",
+                "lang": f"{prefix}{hms(s.get('_duration'))} · PL",
+                "name": f"NapiProjekt · {s.get('_downloads', 0)} pobrań · {s.get('_fps') or '?'} FPS"
+            })
 
         return jsonify({"subtitles": subtitles})
 
@@ -123,4 +150,6 @@ def download_subtitle(hash: str):
 # ────────── uruchomienie serwera ─────────────────────────────
 if __name__ == "__main__":
     log.info("Start addon (pełna lista, TMDB)")
-    serve(app, host="0.0.0.0", port=7002)
+    # Render automatycznie przypisze port
+    port = int(os.environ.get("PORT", 7002))
+    serve(app, host="0.0.0.0", port=port)
