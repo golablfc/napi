@@ -5,6 +5,7 @@ import os
 import re
 import urllib.parse
 import logging
+import requests
 from typing import Dict
 from flask import Flask, jsonify, request, Response
 from waitress import serve
@@ -13,11 +14,11 @@ from napiprojekt_logic import NapiProjektKatalog
 
 # ────────── konfiguracja logów ─────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("stremio_napi.log"), logging.StreamHandler()]
+    handlers=[logging.StreamHandler()] # Logujemy bezpośrednio do konsoli Render
 )
-log = logging.getLogger("ST‑NAPI")
+log = logging.getLogger("ST-NAPI")
 
 app = Flask(__name__)
 napi = NapiProjektKatalog()
@@ -37,6 +38,19 @@ def hms(secs):
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+# ────────── TŁUMACZ ID NA TYTUŁ (NOWOŚĆ) ───────────────────────
+def get_cinemeta_info(ctype: str, imdb_id: str):
+    """Pobiera prawdziwy tytuł i rok z bazy Stremio na podstawie IMDB ID."""
+    try:
+        url = f"https://v3-cinemeta.strem.io/meta/{ctype}/{imdb_id}.json"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json().get("meta", {})
+            return data.get("name", ""), str(data.get("year", ""))[:4]
+    except Exception as e:
+        log.error(f"Cinemeta fetch error: {e}")
+    return "", ""
+
 # ────────── CORS ──────────────────────────────────────────────
 @app.after_request
 def add_cors(resp):
@@ -50,8 +64,8 @@ def add_cors(resp):
 def manifest():
     return jsonify({
         "id": "org.stremio.napiprojekt.python",
-        "version": "6.1.0",
-        "name": "NapiProjekt PL · Nuvio Ready",
+        "version": "6.2.0",
+        "name": "NapiProjekt PL",
         "description": "Napisy z NapiProjekt z obsługą inteligentnego dopasowania po czasie trwania (Nuvio).",
         "resources": ["subtitles"],
         "types": ["movie", "series"],
@@ -70,14 +84,20 @@ def subtitles_list(ctype: str, imdb_plus: str):
         imdb_id = imdb_match.group(1)
 
         params = parse_params(decoded)
+        
+        # 1. Pobieramy tytuł (Cinemeta) żeby NapiProjekt wiedział czego szukać
+        title, year = get_cinemeta_info(ctype, imdb_id)
+        
         item: Dict[str, str] = {
             "imdb_id": imdb_id,
             "season": params.get("season", ""),
             "episode": params.get("episode", ""),
-            "title": "" 
+            "title": title if ctype == "movie" else "",
+            "tvshow": title if ctype == "series" else "",
+            "year": year
         }
 
-        # Pobranie czasu z Nuvio i zamiana na sekundy
+        # 2. Nasłuchujemy na czas z Nuvio
         target_duration_sec = None
         if "durationms" in params:
             target_duration_sec = float(params["durationms"]) / 1000.0
@@ -90,11 +110,9 @@ def subtitles_list(ctype: str, imdb_plus: str):
 
         log.info(f"Searching NapiProjekt with: {item}")
         
-        # Poprawione wywołanie z argumentem imdb_id
         raw = napi.search(item, imdb_id)
         log.info(f"Found {len(raw)} subtitles total")
 
-        # System punktacji (Scoring)
         for s in raw:
             s_score = s.get('_downloads', 0)
             s_dur = s.get('_duration')
@@ -109,14 +127,11 @@ def subtitles_list(ctype: str, imdb_plus: str):
 
             s['_score'] = s_score
 
-        # Sortowanie według najwyższego wyniku
         raw.sort(key=lambda s: s.get('_score', 0), reverse=True)
 
         subtitles = []
         for s in raw:
-            # Oznaczamy idealnie dopasowane napisy w UI
             prefix = "⭐ IDEALNE " if s.get('perfect_match') else ""
-            
             subtitles.append({
                 "id": f"{imdb_id}_{s['link_hash']}_pl",
                 "url": f"{request.url_root}subtitles/download/{s['link_hash']}.srt",
@@ -149,7 +164,6 @@ def download_subtitle(hash: str):
 
 # ────────── uruchomienie serwera ─────────────────────────────
 if __name__ == "__main__":
-    log.info("Start addon (pełna lista, TMDB)")
-    # Render automatycznie przypisze port
+    log.info("Start addon NapiProjekt")
     port = int(os.environ.get("PORT", 7002))
     serve(app, host="0.0.0.0", port=port)
