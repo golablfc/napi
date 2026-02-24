@@ -5,7 +5,7 @@ from waitress import serve
 from napiprojekt_logic import NapiProjektKatalog
 import utils
 
-# Logowanie
+# Konfiguracja logowania
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -14,9 +14,9 @@ napi = NapiProjektKatalog()
 
 MANIFEST = {
     "id": "org.napiprojekt.v3",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "name": "NapiProjekt Cloud",
-    "description": "Napisy bezpośrednio z NapiProjektu",
+    "description": "Prywatny most NapiProjekt -> Stremio",
     "resources": ["subtitles"],
     "types": ["movie", "series"],
     "idPrefixes": ["tt"]
@@ -29,9 +29,9 @@ def manifest():
 @app.route("/subtitles/<mtype>/<imdb_id>.json")
 def subtitles(mtype, imdb_id):
     imdb_id_clean = imdb_id.split(":")[0]
-    log.info(f"Request subtitles for: {imdb_id_clean}")
+    log.info(f"Request for: {imdb_id_clean}")
     
-    # Pobieramy info o tytule z Cinemeta przez utils.py
+    # Pobieranie danych o tytule
     item = utils.get_movie_info(imdb_id_clean)
     results = napi.search(item, imdb_id_clean)
     
@@ -52,12 +52,12 @@ def subtitles(mtype, imdb_id):
 @app.route("/subtitles/download/<path:subid>")
 def download_subtitles(subid):
     encoded_query = subid.replace(".srt", "")
-    # Pobieramy i automatycznie konwertujemy do SRT
+    # Pobranie i automatyczna konwersja (MicroDVD/MPL2 -> SRT)
     raw_content = napi.download(encoded_query)
     
     if raw_content:
         content = utils.auto_convert_to_srt(raw_content)
-        log.info("Napisy przygotowane pomyślnie.")
+        log.info("Subtitle file generated successfully.")
         return Response(content, mimetype='text/plain', headers={
             "Content-Disposition": "attachment; filename=subtitles.srt"
         })
@@ -66,5 +66,5 @@ def download_subtitles(subid):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7002))
-    log.info(f"Uruchamiam serwer na porcie {port}...")
+    log.info(f"Server starting on port {port}...")
     serve(app, host="0.0.0.0", port=port)
