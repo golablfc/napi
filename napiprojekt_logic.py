@@ -10,9 +10,9 @@ logger = logging.getLogger(__name__)
 
 class NapiProjektKatalog:
     def __init__(self):
-        # Wymuszamy HTTPS, aby uniknąć problemów z routingiem HTTP u Cloudflare
-        self.api_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
-        logger.info("NapiProjektKatalog: Tryb Deep-Request (Omijanie 522).")
+        # Używamy surowego HTTP, który bywa szybciej procesowany przez stare API
+        self.api_url = "http://napiprojekt.pl/api/api-napiprojekt3.php"
+        logger.info("NapiProjektKatalog: Tryb Hash-Bypass (Zgodność z Kodi).")
 
     def _decrypt(self, data: bytes) -> bytes:
         # Oryginalne deszyfrowanie XOR z kodu homika
@@ -24,77 +24,51 @@ class NapiProjektKatalog:
         return bytes(dec)
 
     def search(self, item, imdb_id="", *args):
-        eng_title = item.get('title') or item.get('tvshow')
-        year = item.get('year', '')
-        pl_title = "Skazani na Shawshank" if imdb_id == "tt0111161" else eng_title
-        
-        search_pl = f"{pl_title} {year}".strip()
-        search_eng = f"{eng_title} {year}".strip()
-
-        def to_hex(text):
-            return text.encode().hex()
-
-        return [
-            {
-                'language': 'pol',
-                'label': f"Napi API (PL) | {pl_title} ({year})",
-                'link_hash': f"NPX{to_hex(search_pl)}"
-            },
-            {
-                'language': 'pol',
-                'label': f"Napi API (ENG) | {eng_title} ({year})",
-                'link_hash': f"NPX{to_hex(search_eng)}"
-            }
-        ]
+        # Przekazujemy IMDB ID jako link_hash, co pozwoli nam zapytać o konkretny film
+        label = f"NapiProjekt (IMDB) | {item.get('title') or item.get('tvshow')}"
+        return [{
+            'language': 'pol',
+            'label': label,
+            'link_hash': imdb_id
+        }]
 
     def download(self, md5hash, language="PL"):
-        try:
-            clean = md5hash.replace("NPX", "").split('.')[0]
-            query = bytes.fromhex(clean).decode()
-        except Exception:
-            query = md5hash
-
-        # Budujemy surowe żądanie z nagłówkami, które Cloudflare musi przepuścić
+        # Parametry identyczne z tymi, które wysyła dodatek Kodi od lat
+        # Zmieniamy sposób zapytania: zamiast szukać po tytule, pytamy o napisy dla ID
         payload = {
             "mode": "1",
             "client": "NapiProjektPython",
             "client_ver": "0.1",
-            "search_title": query,
-            "downloaded_subtitles_lang": language,
-            "downloaded_subtitles_txt": "1"
+            "downloaded_subtitles_id": md5hash, # Używamy IMDB ID jako identyfikatora
+            "downloaded_subtitles_txt": "1",
+            "downloaded_subtitles_lang": language
         }
         
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
-            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "NapiProjekt/1.0 (Kodi Edition)",
             "Host": "napiprojekt.pl"
         }
         
-        logger.info(f"Ostateczna próba pobrania przez HTTPS dla '{query}'...")
+        logger.info(f"API Request: Pobieram napisy dla identyfikatora '{md5hash}'...")
 
         try:
-            # Używamy session, aby zachować parametry TLS
-            with requests.Session() as s:
-                r = s.post(self.api_url, data=payload, headers=headers, timeout=15)
+            r = requests.post(self.api_url, data=payload, headers=headers, timeout=10)
+            
+            if r.status_code == 200:
+                dom = minidom.parseString(r.text)
+                content_nodes = dom.getElementsByTagName("content")
                 
-                logger.info(f"Odebrano odpowiedź (Status: {r.status_code}).")
-                
-                if r.status_code == 200:
-                    if "nie znaleziono" in r.text.lower():
-                        logger.warning(f"Brak wyników: {query}")
-                        return None
-                    
-                    dom = minidom.parseString(r.text)
-                    content_nodes = dom.getElementsByTagName("content")
-                    if content_nodes and content_nodes[0].firstChild:
-                        raw_data = base64.b64decode(content_nodes[0].firstChild.data)
-                        if raw_data.startswith(b"NP"):
-                            dec = self._decrypt(raw_data[4:])
-                            return zlib.decompress(dec[4:], -zlib.MAX_WBITS).decode("utf-8", "ignore")
-                        return raw_data.decode('utf-8', 'ignore')
-                
-                logger.error(f"API Error (Status: {r.status_code}). Treść: {r.text[:50]}")
+                if content_nodes and content_nodes[0].firstChild:
+                    raw_data = base64.b64decode(content_nodes[0].firstChild.data)
+                    # Deszyfrowanie formatu 'NP'
+                    if raw_data.startswith(b"NP"):
+                        dec = self._decrypt(raw_data[4:])
+                        return zlib.decompress(dec[4:], -zlib.MAX_WBITS).decode("utf-8", "ignore")
+                    return raw_data.decode('utf-8', 'ignore')
+                else:
+                    logger.warning(f"Brak treści dla ID: {md5hash}")
+            else:
+                logger.error(f"API Error: {r.status_code}")
         except Exception as e:
             logger.error(f"Błąd krytyczny: {e}")
             
