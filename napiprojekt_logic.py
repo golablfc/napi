@@ -32,7 +32,7 @@ class NapiProjektKatalog:
         """ FAZA 1: Skrapowanie strony WWW katalogu """
         title = item.get('title') or item.get('tvshow') or ""
         
-        # Test na Skazanych - tu zawsze wyślemy polski tytuł do wyszukiwarki WWW
+        # Test na Skazanych
         if imdb_id == "tt0111161":
             search_query = "Skazani na Shawshank"
         else:
@@ -41,26 +41,37 @@ class NapiProjektKatalog:
         logger.info(f"Napi Search (WWW): Szukam '{search_query}' na stronie katalogu...")
         
         try:
-            # KROK 1: Szukamy filmu w wyszukiwarce na stronie
+            # KROK 1: Szukamy filmu w wyszukiwarce
             url = f"https://www.napiprojekt.pl/katalog-napisow?tytul={urllib.parse.quote(search_query)}"
-            r = requests.get(url, impersonate="chrome120", timeout=10)
+            r = requests.get(url, impersonate="chrome120", timeout=15)
             soup = BeautifulSoup(r.text, 'html.parser')
             
-            # KROK 2: Znajdujemy link do profilu filmu (np. /napisy1,1,1-do-Skazani...)
+            # DIAGNOSTYKA: Tytuł strony (czy Cloudflare nas przepuścił?)
+            page_title = soup.title.string.strip() if soup.title else 'Brak tytułu'
+            logger.info(f"Napi WWW Title: '{page_title}'")
+            
+            # KROK 2: Znajdujemy link do profilu filmu
             movie_link = None
             for a in soup.find_all('a', href=True):
-                if '/napisy' in a['href'] and '-do-' in a['href']:
-                    movie_link = "https://www.napiprojekt.pl" + a['href']
+                href = a['href']
+                # Szukamy słów kluczowych niezależnie od ścieżki i ukośników
+                if 'napisy' in href and '-do-' in href:
+                    if href.startswith('http'):
+                        movie_link = href
+                    else:
+                        movie_link = "https://www.napiprojekt.pl/" + href.lstrip('/')
                     break
                     
             if not movie_link:
-                logger.warning("Napi Search: Nie znaleziono podstrony filmu.")
+                logger.warning("Napi Search: Nie znaleziono podstrony. Pokazuję pierwsze 5 linków:")
+                links = [a['href'] for a in soup.find_all('a', href=True)][:5]
+                logger.warning(f"Linki: {links}")
                 return []
                 
             logger.info(f"Napi Search: Znaleziono profil filmu -> {movie_link}")
             
-            # KROK 3: Wchodzimy w profil i wyciągamy tabelę z hashami (Twoja stara metoda z utils!)
-            r2 = requests.get(movie_link, impersonate="chrome120", timeout=10)
+            # KROK 3: Wchodzimy w profil i wyciągamy tabelę z prawdziwymi hashami
+            r2 = requests.get(movie_link, impersonate="chrome120", timeout=15)
             soup2 = BeautifulSoup(r2.text, 'html.parser')
             
             results = []
@@ -71,7 +82,7 @@ class NapiProjektKatalog:
                 if h in seen: continue
                 seen.add(h)
                 
-                # Próbujemy wyciągnąć informacje o wersji (FPS, release)
+                # Próbujemy wyciągnąć informacje o wersji z tabeli
                 tr = a.find_parent('tr')
                 label = "Polska wersja"
                 if tr:
@@ -102,7 +113,7 @@ class NapiProjektKatalog:
             "mode": "1",
             "client": "NapiProjektPython",
             "client_ver": "0.1",
-            "downloaded_subtitles_id": md5hash, # Używamy Prawdziwego Hasha!
+            "downloaded_subtitles_id": md5hash, # Używamy prawdziwego hasha wyciągniętego z WWW
             "downloaded_subtitles_lang": "PL",
             "downloaded_subtitles_txt": "1"
         }
