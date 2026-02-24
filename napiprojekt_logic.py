@@ -3,8 +3,10 @@ import base64
 import zlib
 import logging
 import re
+import urllib.parse
 from xml.dom import minidom
 from curl_cffi import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -13,13 +15,13 @@ class NapiProjektKatalog:
         self.api_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
         self.headers = {
             "User-Agent": "NapiProjekt/1.0 (Kodi Edition)",
-            "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+            "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,*/*;q=0.5",
             "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
             "Connection": "keep-alive"
         }
 
     def _decrypt(self, data: bytes) -> bytes:
-        # Prawidłowy klucz XOR: 'NAPI_' z kodu homika
+        # Prawidłowy klucz z kodu homika
         key = [0x4e, 0x41, 0x50, 0x49, 0x5f]
         dec = bytearray(data)
         for i in range(len(dec)):
@@ -27,67 +29,102 @@ class NapiProjektKatalog:
         return bytes(dec)
 
     def search(self, item, imdb_id=""):
-        # Pobieramy tytuł i rok
+        """ FAZA 1: Skrapowanie strony WWW katalogu """
         title = item.get('title') or item.get('tvshow') or ""
-        year = item.get('year', '')
         
-        # Test dla Twojego przypadku - wymuszenie polskiego tytułu bez spacji
+        # Test na Skazanych - tu zawsze wyślemy polski tytuł do wyszukiwarki WWW
         if imdb_id == "tt0111161":
-            query = "SkazaninaShawshank1994"
+            search_query = "Skazani na Shawshank"
         else:
-            # Metoda homika: usuwamy wszystko co nie jest literą lub cyfrą
-            clean_title = re.sub(r'[^a-zA-Z0-9]', '', title)
-            query = f"{clean_title}{year}".strip()
-        
-        # Kodujemy do Base64 dla bezpiecznego przesyłu w URL
-        encoded_query = base64.b64encode(query.encode()).decode()
-        
-        logger.info(f"Napi Search (Spaceless): {query}")
-        
-        return [{
-            'language': 'pol',
-            'label': f"NapiProjekt | {title} ({year})",
-            'link_hash': encoded_query
-        }]
+            search_query = title
 
-    def download(self, encoded_query):
+        logger.info(f"Napi Search (WWW): Szukam '{search_query}' na stronie katalogu...")
+        
         try:
-            query = base64.b64decode(encoded_query).decode()
-        except Exception:
-            query = encoded_query
+            # KROK 1: Szukamy filmu w wyszukiwarce na stronie
+            url = f"https://www.napiprojekt.pl/katalog-napisow?tytul={urllib.parse.quote(search_query)}"
+            r = requests.get(url, impersonate="chrome120", timeout=10)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            
+            # KROK 2: Znajdujemy link do profilu filmu (np. /napisy1,1,1-do-Skazani...)
+            movie_link = None
+            for a in soup.find_all('a', href=True):
+                if '/napisy' in a['href'] and '-do-' in a['href']:
+                    movie_link = "https://www.napiprojekt.pl" + a['href']
+                    break
+                    
+            if not movie_link:
+                logger.warning("Napi Search: Nie znaleziono podstrony filmu.")
+                return []
+                
+            logger.info(f"Napi Search: Znaleziono profil filmu -> {movie_link}")
+            
+            # KROK 3: Wchodzimy w profil i wyciągamy tabelę z hashami (Twoja stara metoda z utils!)
+            r2 = requests.get(movie_link, impersonate="chrome120", timeout=10)
+            soup2 = BeautifulSoup(r2.text, 'html.parser')
+            
+            results = []
+            seen = set()
+            
+            for a in soup2.find_all('a', href=re.compile(r'^napiprojekt:')):
+                h = a['href'].replace('napiprojekt:', '')
+                if h in seen: continue
+                seen.add(h)
+                
+                # Próbujemy wyciągnąć informacje o wersji (FPS, release)
+                tr = a.find_parent('tr')
+                label = "Polska wersja"
+                if tr:
+                    cols = tr.find_all('td')
+                    if len(cols) >= 2:
+                        label = cols[1].get_text(strip=True)
+                
+                results.append({
+                    'language': 'pol',
+                    'label': f"Napi | {label}",
+                    'link_hash': h,
+                    '_duration': "??:??:??"
+                })
+                
+            logger.info(f"Napi Search: Znaleziono {len(results)} wersji napisów (Hashy).")
+            return results
 
+        except Exception as e:
+            logger.error(f"Napi WWW Scrape Error: {e}")
+            return []
+
+    def download(self, md5hash):
+        """ FAZA 2: Pobieranie z API za pomocą czystego Hasha MD5 """
+        # Odbezpieczamy hash przysłany ze Stremio
+        md5hash = md5hash.replace(".srt", "")
+        
         payload = {
             "mode": "1",
             "client": "NapiProjektPython",
             "client_ver": "0.1",
-            "search_title": query, # Tu leci wyczyszczony tytuł
+            "downloaded_subtitles_id": md5hash, # Używamy Prawdziwego Hasha!
             "downloaded_subtitles_lang": "PL",
             "downloaded_subtitles_txt": "1"
         }
 
-        logger.info(f"Napi Download: Próba pobrania dla '{query}'...")
+        logger.info(f"Napi Download: Uderzam do API po hash '{md5hash}'...")
 
         try:
             r = requests.post(self.api_url, data=payload, headers=self.headers, 
                               impersonate="chrome120", timeout=15)
-            
-            logger.info(f"DEBUG API Response: {r.text[:300]}")
 
             if r.status_code == 200 and r.text:
-                if "nie znaleziono" in r.text.lower():
-                    return None
-                
                 dom = minidom.parseString(r.text)
                 content_nodes = dom.getElementsByTagName("content")
                 
                 if content_nodes and content_nodes[0].firstChild:
                     raw_data = base64.b64decode(content_nodes[0].firstChild.data)
                     if raw_data.startswith(b"NP"):
-                        # Dekodowanie i dekompresja
                         dec = self._decrypt(raw_data[4:])
                         return zlib.decompress(dec[4:], -zlib.MAX_WBITS).decode("utf-8", "ignore")
                     return raw_data.decode('utf-8', 'ignore')
             
+            logger.warning(f"Napi API (Hash): Odmowa lub brak treści dla hasha {md5hash}")
         except Exception as e:
             logger.error(f"Napi Connection Error: {e}")
             
