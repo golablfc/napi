@@ -3,9 +3,8 @@ import urllib.parse
 import base64
 import zlib
 import logging
-import os
+import requests  # Zmiana na standardowe requests
 from xml.dom import minidom
-from curl_cffi import requests
 
 # Konfiguracja loggera
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -13,10 +12,9 @@ logger = logging.getLogger(__name__)
 
 class NapiProjektKatalog:
     def __init__(self):
-        # Używamy HTTPS dla bezpiecznego połączenia z chmury
-        self.api_url = "https://napiprojekt.pl/api/api-napiprojekt3.php"
-        self.session = requests.Session()
-        logger.info("NapiProjektKatalog: Tryb Legacy API (Cloud Diagnostic Mode).")
+        # Powrót do HTTP, jeśli HTTPS na Renderze powoduje Timeout
+        self.api_url = "http://napiprojekt.pl/api/api-napiprojekt3.php"
+        logger.info("NapiProjektKatalog: Tryb ratunkowy Standard Requests (Render).")
 
     def _decrypt(self, data: bytes) -> bytes:
         # Oryginalna logika deszyfrowania XOR z kodu homika
@@ -28,22 +26,17 @@ class NapiProjektKatalog:
         return bytes(dec)
 
     def search(self, item, imdb_id="", *args):
-        # Pobieramy tytuły
         eng_title = item.get('title') or item.get('tvshow')
-        # Dodajemy rok do wyszukiwania, co drastycznie zwiększa szansę na trafienie w API
         year = item.get('year', '')
-        
         pl_title = "Skazani na Shawshank" if imdb_id == "tt0111161" else eng_title
         
-        # Tworzymy frazę wyszukiwania: Tytuł + Rok
+        # Przygotowujemy czysty tytuł do wyszukiwania
         search_pl = f"{pl_title} {year}".strip()
         search_eng = f"{eng_title} {year}".strip()
 
         def to_hex(text):
             return text.encode().hex()
 
-        logger.info(f"Generowanie opcji API dla: {search_pl}")
-        
         return [
             {
                 'language': 'pol',
@@ -59,14 +52,13 @@ class NapiProjektKatalog:
 
     def download(self, md5hash, language="PL"):
         try:
-            # Dekodowanie HEX z identyfikatora
             clean = md5hash.replace("NPX", "").split('.')[0]
             query = bytes.fromhex(clean).decode()
         except Exception as e:
             logger.error(f"Błąd dekodowania HEX: {e}")
             query = md5hash
 
-        # Parametry żądania identyczne z tymi z Kodi
+        # Parametry identyczne z tymi, które wysyła dodatek Kodi
         payload = {
             "mode": "1",
             "client": "NapiProjektPython",
@@ -76,41 +68,35 @@ class NapiProjektKatalog:
             "downloaded_subtitles_txt": "1"
         }
         
-        logger.info(f"Cloud Request: Pobieram napisy dla '{query}'...")
+        # Ustawiamy podstawowy User-Agent
+        headers = {"User-Agent": "NapiProjekt/1.0 (Kodi Edition)"}
+        
+        logger.info(f"Requests Cloud: Pobieram napisy dla '{query}'...")
 
         try:
-            # Używamy impersonate, aby ominąć zabezpieczenia anty-botowe
-            r = self.session.post(self.api_url, data=payload, impersonate="chrome120", timeout=30)
+            # Używamy standardowej biblioteki requests zamiast curl_cffi
+            r = requests.post(self.api_url, data=payload, headers=headers, timeout=20)
             
-            # Logujemy fragment odpowiedzi dla diagnostyki
-            logger.info(f"Odebrano odpowiedź (Status: {r.status_code}). Długość: {len(r.text)} znaków.")
+            logger.info(f"Odebrano odpowiedź (Status: {r.status_code}).")
             
             if r.status_code == 200:
-                # Sprawdzamy czy odpowiedź zawiera błąd wewnątrz XML
                 if "nie znaleziono" in r.text.lower():
-                    logger.warning(f"API zwróciło 200, ale brak wyników dla: {query}")
+                    logger.warning(f"Brak wyników w API dla: {query}")
                     return None
                 
-                try:
-                    dom = minidom.parseString(r.text)
-                    content_nodes = dom.getElementsByTagName("content")
-                    
-                    if content_nodes and content_nodes[0].firstChild:
-                        raw_data = base64.b64decode(content_nodes[0].firstChild.data)
-                        
-                        # Deszyfrowanie formatu 'NP'
-                        if raw_data.startswith(b"NP"):
-                            dec = self._decrypt(raw_data[4:])
-                            return zlib.decompress(dec[4:], -zlib.MAX_WBITS).decode("utf-8", "ignore")
-                        
-                        return raw_data.decode('utf-8', 'ignore')
-                    else:
-                        logger.warning(f"Brak węzła <content> w odpowiedzi dla: {query}")
-                except Exception as parse_err:
-                    logger.error(f"Błąd parsowania XML: {parse_err}. Treść: {r.text[:100]}...")
+                dom = minidom.parseString(r.text)
+                content_nodes = dom.getElementsByTagName("content")
+                
+                if content_nodes and content_nodes[0].firstChild:
+                    raw_data = base64.b64decode(content_nodes[0].firstChild.data)
+                    # Deszyfrowanie formatu 'NP'
+                    if raw_data.startswith(b"NP"):
+                        dec = self._decrypt(raw_data[4:])
+                        return zlib.decompress(dec[4:], -zlib.MAX_WBITS).decode("utf-8", "ignore")
+                    return raw_data.decode('utf-8', 'ignore')
             
             logger.error(f"API Error (Status: {r.status_code})")
         except Exception as e:
-            logger.error(f"Cloud Connection Error: {e}")
+            logger.error(f"Błąd Requests: {e}")
             
         return None
