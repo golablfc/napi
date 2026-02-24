@@ -125,5 +125,5 @@ def download_subtitles(subid):
 
 # ────────── uruchomienie serwera ─────────────────────────────
 if __name__ == "__main__":
-    log.info("Start addon NapiProjekt (LOCAL TEST MODE)")
-    app.run(host="127.0.0.1", port=7002)
+    port = int(os.environ.get("PORT", 7002))
+    app.run(host="0.0.0.0", port=port)
