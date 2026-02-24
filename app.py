@@ -14,7 +14,7 @@ napi = NapiProjektKatalog()
 
 MANIFEST = {
     "id": "org.napiprojekt.v3",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "name": "NapiProjekt Cloud",
     "description": "Prywatny most NapiProjekt -> Stremio",
     "resources": ["subtitles"],
@@ -52,7 +52,8 @@ def subtitles(mtype, imdb_id):
 @app.route("/subtitles/download/<path:subid>")
 def download_subtitles(subid):
     encoded_query = subid.replace(".srt", "")
-    # Pobranie i automatyczna konwersja (MicroDVD/MPL2 -> SRT)
+    
+    # Pobranie po hashu z NapiProjekt i automatyczna konwersja (MicroDVD/MPL2 -> SRT)
     raw_content = napi.download(encoded_query)
     
     if raw_content:
